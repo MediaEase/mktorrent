@@ -1,0 +1,40 @@
+name: Github Actions CI CD
+
+on: [push, pull_request]
+
+jobs:
+  ci_cd:
+    name: CI/CD
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        openssl: ["ON", "OFF"]
+        pthreads: ["ON", "OFF"]
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Build
+      run: |
+        cmake -S . -B build -DMKTORRENT_LONG_OPTIONS=ON -DMKTORRENT_PTHREADS=${{ matrix.pthreads }} -DMKTORRENT_OPENSSL=${{ matrix.openssl }} -DMKTORRENT_USE_GITREV_VERSION=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON --graphviz=build/target_graph.dot
+        cmake --build build
+
+    - name: Get short commit hash for artifact name
+      shell: bash
+      run: |
+        short_hash=$(echo ${{ github.sha }} | cut -c1-7)
+        echo "MKTORRENT_SHORT_HASH=$short_hash" >> $GITHUB_ENV
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: mktorrent-${{ env.MKTORRENT_SHORT_HASH }}_${{ matrix.os }}_openssl-${{ matrix.openssl }}_pthreads-${{ matrix.pthreads }}
+        path: |
+          build/mktorrent
+          build/compile_commands.json
+          build/target_graph.dot
