@@ -3,9 +3,9 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR) # Configurable policies: <= CMP
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 
 project(mktorrent
-    VERSION 1.1
+    VERSION 1.2.0
     DESCRIPTION "A simple command-line utility to create BitTorrent metainfo files, written in C"
-    HOMEPAGE_URL "https://github.com/Rudde/mktorrent"
+    HOMEPAGE_URL "https://github.com/MediaEase/mktorrent"
     LANGUAGES C
 )
 

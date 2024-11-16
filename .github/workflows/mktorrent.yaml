@@ -17,7 +17,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
 
     - name: Build
       run: |
@@ -31,7 +31,7 @@ jobs:
         echo "MKTORRENT_SHORT_HASH=$short_hash" >> $GITHUB_ENV
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         name: mktorrent-${{ env.MKTORRENT_SHORT_HASH }}_${{ matrix.os }}_openssl-${{ matrix.openssl }}_pthreads-${{ matrix.pthreads }}
         path: |
