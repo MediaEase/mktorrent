@@ -1,6 +1,8 @@
 name: Github Actions CI CD
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
 
 jobs:
   ci_cd:
@@ -20,6 +22,8 @@ jobs:
 
       - name: Build
         run: |
+          mk_version=$(awk '/project\(mktorrent/,/\)/ { if ($1 ~ /VERSION/) print $2 }' CMakeLists.txt | tr -d ')')
+          echo "MKTORRENT_VERSION=$mk_version" >> $GITHUB_ENV
           cmake -S . -B build \
             -DMKTORRENT_LONG_OPTIONS=ON \
             -DMKTORRENT_PTHREADS=${{ matrix.pthreads }} \
@@ -31,17 +35,106 @@ jobs:
           cmake --build build
 
       - name: Get short commit hash for artifact name
-        shell: bash
         id: short-hash
         run: |
           short_hash=$(echo ${{ github.sha }} | cut -c1-7)
           echo "MKTORRENT_SHORT_HASH=$short_hash" >> $GITHUB_ENV
 
+      - name: Prepare artifacts
+        run: |
+          mkdir artifacts
+          full_version="_${{ env.MKTORRENT_VERSION }}-${{ env.MKTORRENT_SHORT_HASH }}_openssl-${{ matrix.openssl }}_pthreads-${{ matrix.pthreads }}-${{ matrix.os }}"
+          echo "FULL_VERSION=$full_version" >> $GITHUB_ENV
+          cp build/mktorrent artifacts/mktorrent$full_version
+          chmod +x artifacts/mktorrent$full_version
+          cp build/compile_commands.json artifacts/compile_commands$full_version.json
+          cp build/target_graph.dot artifacts/target_graph$full_version.dot
+
+      - name: Build Debian Package
+        run: |
+          PKG_DIR="package_mktorrent"
+          mkdir -p "$PKG_DIR/DEBIAN" "$PKG_DIR/usr/bin"
+          mktorrent_bin=$(find . -type f -name "mktorrent*" | head -n 1)
+          strip --strip-unneeded "$mktorrent_bin"
+          chmod +x "$mktorrent_bin"
+          cp $mktorrent_bin "$PKG_DIR/usr/bin/mktorrent"
+          installed_size=$(du -s -k "$PKG_DIR" | cut -f1)
+          description="Simple command-line torrent file creator\n mktorrent is a simple and efficient CLI utility for creating .torrent files.\n .\n Compiler options:\n"
+          if [[ "${{ matrix.openssl }}" == "ON" ]]; then
+            description+=" - MKTORRENT_OPENSSL=ON\n"
+          else
+            description+=" - MKTORRENT_OPENSSL=OFF\n"
+          fi
+          if [[ "${{ matrix.pthreads }}" == "ON" ]]; then
+            description+=" - MKTORRENT_PTHREADS=ON\n"
+          else
+            description+=" - MKTORRENT_PTHREADS=OFF\n"
+          fi
+          description+=" .\n Compiled specifically for MediaEase installations."
+          cat > "$PKG_DIR/DEBIAN/control" <<EOF
+          Package: mktorrent
+          Version: ${{ env.MKTORRENT_VERSION }}-1build1
+          Architecture: amd64
+          Maintainer: Thomas Chauveau <contact.tomc@yahoo.com>
+          Installed-Size: $installed_size
+          Depends: libc6, libssl3
+          Section: net
+          Priority: optional
+          Homepage: https://github.com/MediaEase/mktorrent
+          Description: $description
+          EOF
+          cd "$PKG_DIR"
+          find usr -type f -exec md5sum {} \; > DEBIAN/md5sums
+          cd ..
+          dpkg-deb --build -Zxz -z9 -Sextreme "$PKG_DIR" "mktorrent${{ env.FULL_VERSION }}_amd64.deb"
+          mkdir -p artifacts
+          mv "mktorrent${{ env.FULL_VERSION }}_amd64.deb" artifacts/
+        
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mktorrent-${{ env.MKTORRENT_SHORT_HASH }}_${{ matrix.os }}_openssl-${{ matrix.openssl }}_pthreads-${{ matrix.pthreads }}
-          path: |
-            build/mktorrent
-            build/compile_commands.json
-            build/target_graph.dot
+          name: artifacts-${{ matrix.os }}-openssl-${{ matrix.openssl }}-pthreads-${{ matrix.pthreads }}
+          path: artifacts/
+
+  create_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: ci_cd
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Version from CMakeLists.txt
+        id: extract_version
+        run: |
+          version=$(awk '/project\(mktorrent/,/\)/ { if ($1 ~ /VERSION/) print $2 }' CMakeLists.txt | tr -d ')')
+          echo "Detected version: $version"
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+
+      - name: Create Git Tag
+        run: |
+          git config user.name "${{ secrets.GIT_AUTHOR }}"
+          git config user.email "${{ secrets.GIT_EMAIL }}"
+          git tag v${{ steps.extract_version.outputs.version }}
+          git push origin v${{ steps.extract_version.outputs.version }}
+
+      - name: Prepare release assets
+        run: |
+          mkdir release_assets
+          find downloaded_artifacts -type f -exec cp {} release_assets/ \;
+
+      - name: Create GitHub Release with Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.extract_version.outputs.version }}
+          name: Release v${{ steps.extract_version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            release_assets/*
