@@ -57,18 +57,19 @@ jobs:
           chmod +x "$mktorrent_bin"
           cp $mktorrent_bin "$PKG_DIR/usr/bin/mktorrent"
           installed_size=$(du -s -k "$PKG_DIR" | cut -f1)
-          description="Simple command-line torrent file creator\n mktorrent is a simple and efficient CLI utility for creating .torrent files.\n .\n Compiler options:\n"
-          if [[ "${{ matrix.openssl }}" == "ON" ]]; then
-            description+=" - MKTORRENT_OPENSSL=ON\n"
-          else
-            description+=" - MKTORRENT_OPENSSL=OFF\n"
-          fi
-          if [[ "${{ matrix.pthreads }}" == "ON" ]]; then
-            description+=" - MKTORRENT_PTHREADS=ON\n"
-          else
-            description+=" - MKTORRENT_PTHREADS=OFF\n"
-          fi
-          description+=" .\n Compiled specifically on $(date +%Y-%m-%d)."
+          # temporary file
+          temp_file=$(mktemp)
+          cat > "$temp_file" <<EOF
+          Description: Simple command-line torrent file creator
+           .
+           mktorrent is a simple and efficient CLI utility for creating .torrent files.
+           .
+           Compiler options:
+            - MKTORRENT_OPENSSL=${{ matrix.openssl }}
+            - MKTORRENT_PTHREADS=${{ matrix.pthreads }}
+           . 
+           Compiled on $(date +%Y-%m-%d).
+          EOF
           cat > "$PKG_DIR/DEBIAN/control" <<EOF
           Package: mktorrent
           Version: ${{ env.MKTORRENT_VERSION }}-1build1
@@ -79,8 +80,8 @@ jobs:
           Section: net
           Priority: optional
           Homepage: https://github.com/MediaEase/mktorrent
-          Description: $description
           EOF
+          cat "$temp_file" >> "$PKG_DIR/DEBIAN/control"
           cd "$PKG_DIR"
           find usr -type f -exec md5sum {} \; > DEBIAN/md5sums
           cd ..
