@@ -45,7 +45,6 @@ jobs:
           mkdir artifacts
           full_version="_${{ env.MKTORRENT_VERSION }}_openssl-${{ matrix.openssl }}_pthreads-${{ matrix.pthreads }}-${{ matrix.os }}"
           echo "FULL_VERSION=$full_version" >> $GITHUB_ENV
-          chmod +x artifacts/mktorrent$full_version
           cp build/compile_commands.json artifacts/compile_commands$full_version.json
 
       - name: Build Debian Package
