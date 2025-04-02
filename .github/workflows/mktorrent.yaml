@@ -51,8 +51,9 @@ jobs:
         run: |
           PKG_DIR="package_mktorrent"
           mkdir -p "$PKG_DIR/DEBIAN" "$PKG_DIR/usr/bin"
-          mktorrent_bin=$(find . -type f -name "mktorrent*" | head -n 1)
-          strip --strip-unneeded "$mktorrent_bin"
+          mktorrent_bin=$(find . -type f -name "mktorrent" | head -n 1)
+          echo "MKTORRENT_BIN=$mktorrent_bin"
+          find . -type f -exec file {} \; | grep ELF | cut -d: -f1 | xargs --no-run-if-empty strip --strip-unneeded
           chmod +x "$mktorrent_bin"
           cp $mktorrent_bin "$PKG_DIR/usr/bin/mktorrent"
           installed_size=$(du -s -k "$PKG_DIR" | cut -f1)
