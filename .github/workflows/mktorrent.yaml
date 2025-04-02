@@ -43,12 +43,10 @@ jobs:
       - name: Prepare artifacts
         run: |
           mkdir artifacts
-          full_version="_${{ env.MKTORRENT_VERSION }}-${{ env.MKTORRENT_SHORT_HASH }}_openssl-${{ matrix.openssl }}_pthreads-${{ matrix.pthreads }}-${{ matrix.os }}"
+          full_version="_${{ env.MKTORRENT_VERSION }}_openssl-${{ matrix.openssl }}_pthreads-${{ matrix.pthreads }}-${{ matrix.os }}"
           echo "FULL_VERSION=$full_version" >> $GITHUB_ENV
-          cp build/mktorrent artifacts/mktorrent$full_version
           chmod +x artifacts/mktorrent$full_version
           cp build/compile_commands.json artifacts/compile_commands$full_version.json
-          cp build/target_graph.dot artifacts/target_graph$full_version.dot
 
       - name: Build Debian Package
         run: |
@@ -70,7 +68,7 @@ jobs:
           else
             description+=" - MKTORRENT_PTHREADS=OFF\n"
           fi
-          description+=" .\n Compiled specifically for MediaEase installations."
+          description+=" .\n Compiled specifically on $(date +%Y-%m-%d)."
           cat > "$PKG_DIR/DEBIAN/control" <<EOF
           Package: mktorrent
           Version: ${{ env.MKTORRENT_VERSION }}-1build1
