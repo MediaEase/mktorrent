@@ -30,9 +30,6 @@
 
 #define rol(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
 
-/* blk0() and blk() perform the initial expand. */
-/* I got the idea of expanding during the round function from SSLeay */
-/* FIXME: can we do this in an endian-proof way? */
 #ifdef WORDS_BIGENDIAN
 #define blk0(i) block->l[i]
 #else

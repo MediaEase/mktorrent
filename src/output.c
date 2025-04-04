@@ -283,7 +283,9 @@ EXPORT int write_metainfo(FILE *f, struct metafile *m, unsigned char *hash_strin
 		}
 	}
 
-	/* I made this! */
+#ifndef VERSION
+#define VERSION "1.1"
+#endif
     char const *const created_by = "mktorrent " VERSION;
 	if (!m->no_created_by) {
 		err = fprintf(f, "10:created by%zu:%s", strlen(created_by), created_by);

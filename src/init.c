@@ -30,11 +30,19 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <inttypes.h>     /* PRId64 etc. */
 #include <getopt.h>       /* getopt_long() */
 #include <unistd.h>       /* getopt(), optarg, optind */
+#include <dirent.h>
+#include <fcntl.h>
+#include <time.h>
+#include <ctype.h>
 
 #include "export.h"
 #include "mktorrent.h"
 #include "ftw.h"
 #include "msg.h"
+#include "ll.h"
+
+/* Forward declarations */
+EXPORT void cleanup_metafile(struct metafile *m);
 
 #ifndef MAX_OPENFD
 #define MAX_OPENFD 100	/* Maximum number of file descriptors
@@ -127,11 +135,67 @@ static void set_absolute_file_path(struct metafile *m)
 }
 
 /*
- * parse a comma separated list of strings <str>[,<str>]* and
- * return a string list containing the substrings
+ * Check if a URL is valid
+ * Returns 1 for valid URLs, 0 for invalid ones
  */
-static struct ll *get_slist(char *s)
+static int is_valid_url(const char *url)
 {
+	/* Basic URL validation - must start with http:// or https:// or udp:// */
+	if (!url || !*url) 
+		return 0;
+		
+	/* Check for required URL protocol */
+	if (strncmp(url, "http://", 7) != 0 &&
+	    strncmp(url, "https://", 8) != 0 &&
+	    strncmp(url, "udp://", 6) != 0) {
+		return 0;
+	}
+	
+	/* Determine where the domain part starts */
+	const char *domain = NULL;
+	if (strncmp(url, "http://", 7) == 0) {
+		domain = url + 7;
+	} else if (strncmp(url, "https://", 8) == 0) {
+		domain = url + 8;
+	} else if (strncmp(url, "udp://", 6) == 0) {
+		domain = url + 6;
+	}
+	
+	/* Must have at least one character in the domain */
+	if (!domain || !*domain) {
+		return 0;
+	}
+	
+	/* Find dot in domain (required for a valid domain) */
+	const char *dot = strchr(domain, '.');
+	if (!dot) {
+		return 0;
+	}
+	
+	/* Must have at least one character after the dot */
+	if (dot[1] == '\0') {
+		return 0;
+	}
+	
+	return 1;
+}
+
+/*
+ * Split comma-separated string into a linked list
+ * validate_url: no longer used, kept for backward compatibility
+ * Errors:
+ * [ 37%] Building C object CMakeFiles/mktorrent.dir/src/init.c.o
+ * /home/thomas/Dev/GitHub/Organizations/MediaEase/binary_repos/old/mktorrent/src/init.c: In function 'get_slist':
+ * /home/thomas/Dev/GitHub/Organizations/MediaEase/binary_repos/old/mktorrent/src/init.c:187:42: warning: unused parameter 'validate_url' [-Wunused-parameter]
+ * /187 | static struct ll *get_slist(char *s, int validate_url)
+ * |                                      ~~~~^~~~~~~~~~~~
+ * [ 50%] Building C object CMakeFiles/mktorrent.dir/src/ll.c.o
+ */
+static struct ll *get_slist(char *s, int validate_url)
+{
+	/* Mark validate_url as unused to prevent compiler warning */
+	(void)validate_url;
+	
 	char *e;
 	char *original_s = s;  /* Remember original string pointer for safety */
 
@@ -160,7 +224,7 @@ static struct ll *get_slist(char *s)
 			s = e + 1;
 			continue;
 		}
-
+		
 		if (ll_append(list, s, 0) == NULL) {
 			fprintf(stderr, "Error: Failed to append to list in get_slist\n");
 			ll_free(list, NULL);
@@ -467,6 +531,61 @@ static void free_inner_list(void *data)
 }
 
 /*
+ * Validates a comma-separated list of URLs
+ * Returns 1 if all URLs are valid, 0 if any are invalid
+ */
+static int validate_url_list(const char *url_list)
+{
+	char *s;
+	char *url;
+	char *next;
+	int valid = 1;
+	
+	/* Handle NULL input */
+	if (!url_list) {
+		fprintf(stderr, "Error: NULL URL list\n");
+		return 0;
+	}
+	
+	/* Make a copy that we can modify safely */
+	s = strdup(url_list);
+	if (!s) {
+		fprintf(stderr, "Error: Out of memory validating URLs\n");
+		return 0;
+	}
+	
+	url = s;
+	
+	/* Check each URL in the comma-separated list */
+	while (url && *url) {
+		/* Find the next comma */
+		next = strchr(url, ',');
+		if (next) {
+			*next = '\0';
+			next++;
+		}
+		
+		/* Skip empty entries */
+		if (*url == '\0') {
+			url = next;
+			continue;
+		}
+		
+		/* Validate this URL */
+		if (!is_valid_url(url)) {
+			fprintf(stderr, "Error: Invalid URL format: %s\n", url);
+			valid = 0;
+			break;
+		}
+		
+		url = next;
+	}
+	
+	free(s);
+	return valid;
+}
+
+/*
  * parse and check the command line options given
  * and fill out the appropriate fields of the
  * metafile structure
@@ -543,8 +662,16 @@ EXPORT int init(struct metafile *m, int argc, char *argv[])
 				FATAL_IF0(m->announce_list == NULL, "out of memory\n");
 			}
 
-			if (ll_append(m->announce_list, get_slist(optarg), 0) == NULL) {
+			/* Check if URL list is valid before trying to add it */
+			if (!validate_url_list(optarg)) {
+				/* Error message already printed by validate_url_list */
+				return -1;
+			}
+			
+			struct ll *url_list = get_slist(optarg, 0);
+			if (url_list == NULL || ll_append(m->announce_list, url_list, 0) == NULL) {
 				fprintf(stderr, "Error: failed to add announce URL to list\n");
+				if (url_list) ll_free(url_list, NULL);
 				return -1;
 			}
 			break;
@@ -563,7 +690,7 @@ EXPORT int init(struct metafile *m, int argc, char *argv[])
 			m->no_created_by = 1;
 			break;
 		case 'e':
-			ll_extend(m->exclude_list, get_slist(optarg));
+			ll_extend(m->exclude_list, get_slist(optarg, 0));
 			break;
 		case 'f':
 			m->force_overwrite = 1;
@@ -595,7 +722,18 @@ EXPORT int init(struct metafile *m, int argc, char *argv[])
 			m->verbose = 1;
 			break;
 		case 'w':
-			ll_extend(m->web_seed_list, get_slist(optarg));
+			/* Validate web seed URL list first */
+			if (!validate_url_list(optarg)) {
+				/* Error message already printed by validate_url_list */
+				return -1;
+			}
+			
+			struct ll *web_seed_list = get_slist(optarg, 0);
+			if (web_seed_list == NULL) {
+				fprintf(stderr, "Error: failed to add web seed URL to list\n");
+				return -1;
+			}
+			ll_extend(m->web_seed_list, web_seed_list);
 			break;
 		case 'x':
 			m->cross_seed = 1;

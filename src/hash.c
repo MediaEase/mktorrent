@@ -25,6 +25,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <fcntl.h>        /* open() */
 #include <unistd.h>       /* read(), close() */
 #include <inttypes.h>     /* PRId64 etc. */
+#include <sys/stat.h>     /* struct stat */
 
 #ifdef USE_OPENSSL
 #include <openssl/sha.h>  /* SHA1() */

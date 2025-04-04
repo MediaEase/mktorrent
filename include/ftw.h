@@ -1,6 +1,7 @@
 #ifndef MKTORRENT_FTW_H
 #define MKTORRENT_FTW_H
 
+#include <sys/stat.h>  /* struct stat */
 #include "export.h"
 
 typedef int (*file_tree_walk_cb)(const char *name,

@@ -28,6 +28,25 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <time.h>        /* clock_gettime() */
 #include <signal.h>      /* signal handling */
 #include <inttypes.h>    /* PRIuMAX etc. */
+#include <pthread.h>
+
+/* Define constants that may be missing */
+#ifndef MAX_OPENFD
+#define MAX_OPENFD 100
+#endif
+
+#ifndef PROGRESS_PERIOD
+#define PROGRESS_PERIOD 200000
+#endif
+
+/* Define clock types if not already defined */
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 0
+#endif
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
 
 #include "export.h"
 #include "mktorrent.h"
@@ -242,9 +261,11 @@ int main(int argc, char *argv[])
 	srandom(ts.tv_nsec ^ ts.tv_sec);
 
 	/* Process command line options */
-	if (init(&m, argc, argv) != 0) {
+	int init_result = init(&m, argc, argv);
+	if (init_result != 0) {
 		fprintf(stderr, "Failed to initialize from command line arguments\n");
 		cleanup_metafile(&m);
+		/* Return EXIT_FAILURE on error from init */
 		return EXIT_FAILURE;
 	}
 
