@@ -1,3 +1,5 @@
 # assuming out-of-tree builds inside ./build/, this is enough
 build/
 compile_commands.json
+tests/test_data/
+tests/test_results/

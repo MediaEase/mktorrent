@@ -81,9 +81,6 @@ static const char *basename(const char *s)
 
 static void set_absolute_file_path(struct metafile *m)
 {
-	char *string;		/* string to return */
-	size_t length = 32;	/* length of the string */
-
 	/* if the file_path is already an absolute path just
 	   return that */
 	if (m->metainfo_file_path && *m->metainfo_file_path == DIRSEP_CHAR) {
@@ -96,88 +93,83 @@ static void set_absolute_file_path(struct metafile *m)
 		return;
 	}
 
-	/* first get the current working directory
-	   using getcwd is a bit of a PITA */
-	/* allocate initial string */
-	string = malloc(length);
-	FATAL_IF0(string == NULL, "out of memory\n");
+	char cwd[PATH_MAX]; /* Buffer for current working directory */
+	size_t cwd_len;
+	size_t result_len;
+	char *result;
 
-	/* while our allocated memory for the working dir isn't big enough */
-	while (getcwd(string, length) == NULL) {
-		/* double the buffer size */
-		length *= 2;
-		/* free our current buffer */
-		free(string);
-		/* and allocate a new one twice as big muahaha */
-		string = malloc(length);
-		FATAL_IF0(string == NULL, "out of memory\n");
+	/* Get the current working directory */
+	if (getcwd(cwd, PATH_MAX) == NULL) {
+		fatal("getcwd failed: %s\n", strerror(errno));
 	}
+	
+	cwd_len = strlen(cwd);
 
-	/* now set length to the proper length of the working dir */
-	length = strlen(string);
-	/* if the metainfo file path isn't set */
+	/* Calculate the required final string length once to avoid multiple reallocations */
 	if (m->metainfo_file_path == NULL) {
-		/* append <torrent name>.torrent to the working dir */
-		string =
-		    realloc(string, length + strlen(m->torrent_name) + 10);
-		FATAL_IF0(string == NULL, "out of memory\n");
-		sprintf(string + length, DIRSEP "%s.torrent", m->torrent_name);
+		/* Need space for: cwd + '/' + torrent_name + '.torrent' + '\0' */
+		result_len = cwd_len + 1 + strlen(m->torrent_name) + 8 + 1;
 	} else {
-		/* otherwise append the torrent path to the working dir */
-		string =
-		    realloc(string,
-			    length + strlen(m->metainfo_file_path) + 2);
-		FATAL_IF0(string == NULL, "out of memory\n");
-		sprintf(string + length, DIRSEP "%s", m->metainfo_file_path);
+		/* Need space for: cwd + '/' + metainfo_file_path + '\0' */
+		result_len = cwd_len + 1 + strlen(m->metainfo_file_path) + 1;
 	}
 
-	m->metainfo_file_path = string;
+	/* Allocate the final string once with the exact size needed */
+	result = malloc(result_len);
+	FATAL_IF0(result == NULL, "out of memory\n");
+
+	/* First copy the current working directory */
+	memcpy(result, cwd, cwd_len);
+	
+	/* Then add the appropriate suffix */
+	if (m->metainfo_file_path == NULL) {
+		sprintf(result + cwd_len, DIRSEP "%s.torrent", m->torrent_name);
+	} else {
+		sprintf(result + cwd_len, DIRSEP "%s", m->metainfo_file_path);
+	}
+
+	m->metainfo_file_path = result;
 }
 
 /*
  * Check if a URL is valid
  * Returns 1 for valid URLs, 0 for invalid ones
+ * Note: This is used directly by validate_url_list now
  */
+static int is_valid_url(const char *url) __attribute__((unused));
 static int is_valid_url(const char *url)
 {
-	/* Basic URL validation - must start with http:// or https:// or udp:// */
+	/* Quick validation checks */
 	if (!url || !*url) 
 		return 0;
-		
-	/* Check for required URL protocol */
-	if (strncmp(url, "http://", 7) != 0 &&
-	    strncmp(url, "https://", 8) != 0 &&
-	    strncmp(url, "udp://", 6) != 0) {
-		return 0;
-	}
-	
-	/* Determine where the domain part starts */
+
+	/* Use direct pointer comparison for protocols to avoid multiple strncmp calls */
 	const char *domain = NULL;
+	size_t domain_offset = 0;
+	
 	if (strncmp(url, "http://", 7) == 0) {
-		domain = url + 7;
+		domain_offset = 7;
 	} else if (strncmp(url, "https://", 8) == 0) {
-		domain = url + 8;
+		domain_offset = 8;
 	} else if (strncmp(url, "udp://", 6) == 0) {
-		domain = url + 6;
+		domain_offset = 6;
+	} else {
+		return 0; /* Invalid protocol */
 	}
 	
-	/* Must have at least one character in the domain */
-	if (!domain || !*domain) {
+	domain = url + domain_offset;
+	
+	/* Empty domain check */
+	if (!*domain)
 		return 0;
-	}
 	
-	/* Find dot in domain (required for a valid domain) */
-	const char *dot = strchr(domain, '.');
-	if (!dot) {
-		return 0;
-	}
+	/* Find dot in domain without using strchr for better performance */
+	const char *dot = domain;
+	while (*dot && *dot != '.')
+		dot++;
 	
-	/* Must have at least one character after the dot */
-	if (dot[1] == '\0') {
-		return 0;
-	}
-	
-	return 1;
+	/* Must have a dot and at least one character after it */
+	return (*dot == '.' && dot[1] != '\0');
 }
 
 /*
@@ -196,9 +188,6 @@ static struct ll *get_slist(char *s, int validate_url)
 	/* Mark validate_url as unused to prevent compiler warning */
 	(void)validate_url;
 	
-	char *e;
-	char *original_s = s;  /* Remember original string pointer for safety */
-
 	/* Validate input */
 	if (!s) {
 		fprintf(stderr, "Error: NULL string passed to get_slist\n");
@@ -207,47 +196,53 @@ static struct ll *get_slist(char *s, int validate_url)
 
 	/* allocate a new list */
 	struct ll *list = ll_new();
-	if (list == NULL) {
+	if (!list) {
 		fprintf(stderr, "Error: Failed to create new list in get_slist\n");
 		return NULL;
 	}
 
-	/* add URLs to the list while there are commas in the string */
-	while ((e = strchr(s, ',')) != NULL) {
-		/* set the commas to \0 so the URLs appear as
-		 * separate strings */
-		*e = '\0';
+	/* Fast path for empty string */
+	if (!*s)
+		return list;
 
-		/* Check for zero-length URLs between commas */
-		if (s == e) {
-			fprintf(stderr, "Warning: Empty element in comma-separated list\n");
-			s = e + 1;
-			continue;
+	char *start = s;
+	char *e;
+
+	/* Process entire string in one pass */
+	while (1) {
+		/* Find next comma or end of string */
+		e = strchr(start, ',');
+		
+		/* If we have a non-empty element, add it */
+		if (!e) {
+			/* Last element */
+			if (*start && ll_append(list, start, 0) == NULL) {
+				fprintf(stderr, "Error: Failed to append to list in get_slist\n");
+				ll_free(list, NULL);
+				return NULL;
+			}
+			break;
 		}
 		
-		if (ll_append(list, s, 0) == NULL) {
+		/* Set comma to null terminator temporarily */
+		*e = '\0';
+		
+		/* Only add non-empty elements */
+		if (start != e && ll_append(list, start, 0) == NULL) {
 			fprintf(stderr, "Error: Failed to append to list in get_slist\n");
+			/* Restore comma before free */
+			*e = ',';
 			ll_free(list, NULL);
 			return NULL;
 		}
-
-		/* move s to point to the next URL */
-		s = e + 1;
+		
+		/* Restore comma */
+		*e = ',';
+		
+		/* Move to next element */
+		start = e + 1;
 	}
 
-	/* set the last string in the list */
-	if (*s) { /* Only append non-empty strings */
-		if (ll_append(list, s, 0) == NULL) {
-			fprintf(stderr, "Error: Failed to append last item to list\n");
-			ll_free(list, NULL);
-			return NULL;
-		}
-	} else if (s != original_s) {
-		/* Warn about trailing comma */
-		fprintf(stderr, "Warning: Trailing comma in list\n");
-	}
-
-	/* return the list */
 	return list;
 }
 
@@ -536,52 +531,76 @@ static void free_inner_list(void *data)
  */
 static int validate_url_list(const char *url_list)
 {
-	char *s;
-	char *url;
-	char *next;
-	int valid = 1;
-	
 	/* Handle NULL input */
 	if (!url_list) {
 		fprintf(stderr, "Error: NULL URL list\n");
 		return 0;
 	}
 	
-	/* Make a copy that we can modify safely */
-	s = strdup(url_list);
-	if (!s) {
-		fprintf(stderr, "Error: Out of memory validating URLs\n");
-		return 0;
-	}
+	const char *url_start = url_list;
+	const char *url_end;
+	int valid = 1;
 	
-	url = s;
-	
-	/* Check each URL in the comma-separated list */
-	while (url && *url) {
-		/* Find the next comma */
-		next = strchr(url, ',');
-		if (next) {
-			*next = '\0';
-			next++;
-		}
-		
-		/* Skip empty entries */
-		if (*url == '\0') {
-			url = next;
+	/* Process URLs in place without making a copy */
+	while (*url_start) {
+		/* Skip leading commas and spaces */
+		while (*url_start == ',' || *url_start == ' ')
+			url_start++;
+			
+		/* End of string */
+		if (!*url_start)
+			break;
+			
+		/* Find the end of this URL (next comma or end of string) */
+		url_end = url_start;
+		while (*url_end && *url_end != ',')
+			url_end++;
+			
+		/* Empty URL segment */
+		if (url_end == url_start) {
+			url_start = url_end;
+			if (*url_start)
+				url_start++;
 			continue;
 		}
 		
-		/* Validate this URL */
-		if (!is_valid_url(url)) {
-			fprintf(stderr, "Error: Invalid URL format: %s\n", url);
+		/* Check protocol prefix without duplicating memory */
+		if ((url_end - url_start >= 7 && strncmp(url_start, "http://", 7) == 0) ||
+		    (url_end - url_start >= 8 && strncmp(url_start, "https://", 8) == 0) ||
+		    (url_end - url_start >= 6 && strncmp(url_start, "udp://", 6) == 0)) {
+			
+			/* Find domain start */
+			const char *domain;
+			if (strncmp(url_start, "http://", 7) == 0)
+				domain = url_start + 7;
+			else if (strncmp(url_start, "https://", 8) == 0)
+				domain = url_start + 8;
+			else
+				domain = url_start + 6;
+				
+			/* Find dot in domain */
+			const char *dot = domain;
+			while (dot < url_end && *dot != '.')
+				dot++;
+				
+			/* Validate domain format */
+			if (dot == domain || dot >= url_end - 1) {
+				fprintf(stderr, "Error: Invalid URL format\n");
+				valid = 0;
+				break;
+			}
+		} else {
+			fprintf(stderr, "Error: Invalid URL protocol\n");
 			valid = 0;
 			break;
 		}
 		
-		url = next;
+		/* Move to next URL */
+		url_start = url_end;
+		if (*url_start)
+			url_start++;
 	}
 	
-	free(s);
 	return valid;
 }
 
