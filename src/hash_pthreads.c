@@ -28,9 +28,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <inttypes.h>     /* PRId64 etc. */
 #include <pthread.h>
 #include <time.h>         /* nanosleep() */
+#include <sys/stat.h>     /* fstat() */
 
 #ifdef USE_OPENSSL
-#define OPENSSL_API_COMPAT 0x10100000L
 #include <openssl/sha.h>  /* SHA1() */
 #else
 #include "sha1.h"
@@ -50,13 +50,14 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #endif
 
 #define OPENFLAGS (O_RDONLY | O_BINARY)
-
+#define MIN_READ_SIZE (64 * 1024)  /* 64KB minimum read size */
+#define MAX_BUFFERS_PER_THREAD 4   /* Maximum buffers per thread */
 
 struct piece {
 	struct piece *next;
 	unsigned char *dest;
 	unsigned long len;
-	unsigned char data[1];
+	unsigned char data[1];  /* flexible array member */
 };
 
 struct queue {
@@ -71,6 +72,7 @@ struct queue {
 	unsigned int done;
 	unsigned int pieces;
 	unsigned int pieces_hashed;
+	int verbose;
 };
 
 static struct piece *get_free(struct queue *q, size_t piece_length)
@@ -84,8 +86,6 @@ static struct piece *get_free(struct queue *q, size_t piece_length)
 	} else if (q->buffers < q->buffers_max) {
 		r = malloc(sizeof(struct piece) - 1 + piece_length);
 		FATAL_IF0(r == NULL, "out of memory\n");
-
-
 		q->buffers++;
 	} else {
 		while (q->free == NULL) {
@@ -149,15 +149,25 @@ static void set_done(struct queue *q)
 
 static void free_buffers(struct queue *q)
 {
-	struct piece *first = q->free;
+	struct piece *current = q->free;
+	struct piece *next;
 
-	while (first) {
-		struct piece *p = first;
-		first = p->next;
-		free(p);
+	while (current) {
+		next = current->next;
+		free(current);
+		current = next;
+	}
+
+	/* Also free any pieces in the full queue that weren't processed */
+	current = q->full;
+	while (current) {
+		next = current->next;
+		free(current);
+		current = next;
 	}
 
 	q->free = NULL;
+	q->full = NULL;
 }
 
 /*
@@ -168,6 +178,9 @@ static void *print_progress(void *data)
 	struct queue *q = data;
 	int err;
 	struct timespec t;
+	unsigned int last_pieces_hashed = 0;
+	unsigned int current_speed = 0;
+	time_t last_update_time = time(NULL);
 
 	t.tv_sec = PROGRESS_PERIOD / 1000000;
 	t.tv_nsec = PROGRESS_PERIOD % 1000000 * 1000;
@@ -176,9 +189,27 @@ static void *print_progress(void *data)
 	FATAL_IF(err, "cannot set thread cancel type: %s\n", strerror(err));
 
 	while (1) {
+		/* Calculate hashing speed */
+		time_t current_time = time(NULL);
+		time_t elapsed = current_time - last_update_time;
+		
+		if (elapsed >= 1) {
+			current_speed = (q->pieces_hashed - last_pieces_hashed) / elapsed;
+			last_pieces_hashed = q->pieces_hashed;
+			last_update_time = current_time;
+		}
+
 		/* print progress and flush the buffer immediately */
-		printf("\rHashed %u of %u pieces.", q->pieces_hashed, q->pieces);
+		if (q->verbose) {
+			printf("\rHashed %u of %u pieces (%.1f%%) at %u pieces/sec", 
+				q->pieces_hashed, q->pieces, 
+				q->pieces > 0 ? (float)q->pieces_hashed * 100 / q->pieces : 0,
+				current_speed);
+		} else {
+			printf("\rHashed %u of %u pieces.", q->pieces_hashed, q->pieces);
+		}
 		fflush(stdout);
+		
 		/* now sleep for PROGRESS_PERIOD microseconds */
 		nanosleep(&t, NULL);
 	}
@@ -212,6 +243,8 @@ static void read_files(struct metafile *m, struct queue *q, unsigned char *pos)
 	                          should match size when done */
 #endif
 	struct piece *p = get_free(q, m->piece_length);
+	struct stat file_stat;
+	size_t optimal_block_size = MIN_READ_SIZE;
 
 	/* go through all the files in the file list */
 	LL_FOR(file_node, m->file_list) {
@@ -220,9 +253,20 @@ static void read_files(struct metafile *m, struct queue *q, unsigned char *pos)
 		/* open the current file for reading */
 		FATAL_IF((fd = open(f->path, OPENFLAGS)) == -1,
 			"cannot open '%s' for reading: %s\n", f->path, strerror(errno));
+		
+		/* Get file system block size for optimal reading */
+		if (fstat(fd, &file_stat) == 0) {
+			if (file_stat.st_blksize > MIN_READ_SIZE) {
+				optimal_block_size = file_stat.st_blksize;
+			}
+		}
 
 		while (1) {
-			ssize_t d = read(fd, p->data + r, m->piece_length - r);
+			/* Try to read in optimal block size chunks, but limit to remaining piece length */
+			size_t to_read = m->piece_length - r;
+			if (to_read > optimal_block_size) to_read = optimal_block_size;
+			
+			ssize_t d = read(fd, p->data + r, to_read);
 
 			FATAL_IF(d < 0, "cannot read from '%s': %s\n",
 				f->path, strerror(errno));
@@ -255,11 +299,14 @@ static void read_files(struct metafile *m, struct queue *q, unsigned char *pos)
 		p->dest = pos;
 		p->len = r;
 		put_full(q, p);
-	} else
+#ifndef NO_HASH_CHECK
+		counter += r;
+#endif
+	} else {
 		put_free(q, p, 0);
+	}
 
 #ifndef NO_HASH_CHECK
-	counter += r;
 	FATAL_IF(counter != m->size,
 		"counted %" PRIuMAX " bytes, but hashed %" PRIuMAX " bytes; "
 		"something is wrong...\n",
@@ -275,7 +322,8 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 		PTHREAD_MUTEX_INITIALIZER,
 		PTHREAD_COND_INITIALIZER,
 		PTHREAD_COND_INITIALIZER,
-		0, 0, 0
+		0, 0, 0,
+		m->verbose
 	};
 	pthread_t print_progress_thread;	/* progress printer thread */
 	pthread_t *workers;
@@ -288,7 +336,7 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 	FATAL_IF0(workers == NULL || hash_string == NULL, "out of memory\n");
 
 	q.pieces = m->pieces;
-	q.buffers_max = 3*m->threads;
+	q.buffers_max = MAX_BUFFERS_PER_THREAD * m->threads;
 
 	/* create worker threads */
 	for (i = 0; i < m->threads; i++) {
@@ -332,7 +380,7 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 	free_buffers(&q);
 
 	/* ok, let the user know we're done too */
-	printf("\rhashed %u of %u pieces\n", q.pieces_hashed, q.pieces);
+	printf("\rHashed %u of %u pieces (100.0%%)\n", q.pieces_hashed, q.pieces);
 
 	return hash_string;
 }
