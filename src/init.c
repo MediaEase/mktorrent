@@ -48,6 +48,8 @@ static void strip_ending_dirseps(char *s)
 {
 	char *end = s;
 
+	if (!s) return;  /* Guard against NULL pointer */
+
 	while (*end)
 		end++;
 
@@ -58,6 +60,8 @@ static void strip_ending_dirseps(char *s)
 static const char *basename(const char *s)
 {
 	const char *r = s;
+
+	if (!s) return "";  /* Guard against NULL pointer */
 
 	while (*s != '\0') {
 		if (*s == DIRSEP_CHAR)
@@ -131,25 +135,55 @@ static void set_absolute_file_path(struct metafile *m)
 static struct ll *get_slist(char *s)
 {
 	char *e;
+	char *original_s = s;  /* Remember original string pointer for safety */
+
+	/* Validate input */
+	if (!s) {
+		fprintf(stderr, "Error: NULL string passed to get_slist\n");
+		return NULL;
+	}
 
 	/* allocate a new list */
 	struct ll *list = ll_new();
-	FATAL_IF0(list == NULL, "out of memory\n");
+	if (list == NULL) {
+		fprintf(stderr, "Error: Failed to create new list in get_slist\n");
+		return NULL;
+	}
 
 	/* add URLs to the list while there are commas in the string */
-	while ((e = strchr(s, ','))) {
+	while ((e = strchr(s, ',')) != NULL) {
 		/* set the commas to \0 so the URLs appear as
 		 * separate strings */
 		*e = '\0';
 
-		FATAL_IF0(ll_append(list, s, 0) == NULL, "out of memory\n");
+		/* Check for zero-length URLs between commas */
+		if (s == e) {
+			fprintf(stderr, "Warning: Empty element in comma-separated list\n");
+			s = e + 1;
+			continue;
+		}
+
+		if (ll_append(list, s, 0) == NULL) {
+			fprintf(stderr, "Error: Failed to append to list in get_slist\n");
+			ll_free(list, NULL);
+			return NULL;
+		}
 
 		/* move s to point to the next URL */
 		s = e + 1;
 	}
 
 	/* set the last string in the list */
-	FATAL_IF0(ll_append(list, s, 0) == NULL, "out of memory\n");
+	if (*s) { /* Only append non-empty strings */
+		if (ll_append(list, s, 0) == NULL) {
+			fprintf(stderr, "Error: Failed to append last item to list\n");
+			ll_free(list, NULL);
+			return NULL;
+		}
+	} else if (s != original_s) {
+		/* Warn about trailing comma */
+		fprintf(stderr, "Warning: Trailing comma in list\n");
+	}
 
 	/* return the list */
 	return list;
@@ -163,31 +197,51 @@ static int is_dir(struct metafile *m, char *target)
 {
 	struct stat s;		/* stat structure for stat() to fill */
 
+	if (!target || !*target) {
+		fprintf(stderr, "Error: Empty target path\n");
+		return -1;
+	}
+
 	/* stat the target */
-	FATAL_IF(stat(target, &s), "cannot stat '%s': %s\n",
-		target, strerror(errno));
+	if (stat(target, &s) == -1) {
+		fprintf(stderr, "Cannot stat '%s': %s\n", target, strerror(errno));
+		return -1;
+	}
 
 	/* if it is a directory, just return 1 */
 	if (S_ISDIR(s.st_mode))
 		return 1;
 
 	/* if it isn't a regular file either, something is wrong.. */
-	FATAL_IF(!S_ISREG(s.st_mode),
-		"'%s' is neither a directory nor regular file\n", target);
+	if (!S_ISREG(s.st_mode)) {
+		fprintf(stderr, "'%s' is neither a directory nor regular file\n", target);
+		return -1;
+	}
 
 	/* if it has negative size, something it wrong */
-	FATAL_IF(s.st_size < 0, "'%s' has negative size\n", target);
+	if (s.st_size < 0) {
+		fprintf(stderr, "'%s' has negative size\n", target);
+		return -1;
+	}
 
 	/* since we know the torrent is just a single file and we've
 	   already stat'ed it, we might as well set the file list */
+	char *path_copy = strdup(target);
+	if (!path_copy) {
+		fprintf(stderr, "Error: Out of memory when duplicating path\n");
+		return -1;
+	}
+
 	struct file_data fd = {
-		strdup(target),
+		path_copy,
 		(uintmax_t) s.st_size
 	};
 
-	FATAL_IF0(
-		fd.path == NULL || ll_append(m->file_list, &fd, sizeof(fd)) == NULL,
-		"out of memory\n");
+	if (ll_append(m->file_list, &fd, sizeof(fd)) == NULL) {
+		fprintf(stderr, "Error: Out of memory when appending to file list\n");
+		free(path_copy);
+		return -1;
+	}
 
 	/* ..and size variable */
 	m->size = (uintmax_t) s.st_size;

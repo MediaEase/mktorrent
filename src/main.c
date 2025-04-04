@@ -26,6 +26,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <fcntl.h>       /* open() */
 #include <unistd.h>      /* close(), read() */
 #include <time.h>        /* clock_gettime() */
+#include <signal.h>      /* signal handling */
+#include <inttypes.h>    /* PRIuMAX etc. */
 
 #include "export.h"
 #include "mktorrent.h"
@@ -77,6 +79,18 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #define BUILD_CFG "unspecified_build_type"
 #endif
 
+/* Global flag for handling interrupts */
+static volatile int force_exit = 0;
+
+/* Signal handler for graceful exit */
+static void handle_signal(int signum)
+{
+	if (signum == SIGINT || signum == SIGTERM) {
+		fprintf(stderr, "\nReceived signal %d, cleaning up...\n", signum);
+		force_exit = 1;
+	}
+}
+
 /*
  * create and open the metainfo file for writing and create a stream for it
  * we don't want to overwrite anything, so abort if the file is already there
@@ -87,20 +101,29 @@ static FILE *open_file(const char *path, int force)
 	int fd;  /* file descriptor */
 	FILE *f; /* file stream */
 
+	if (!path || !*path) {
+		fprintf(stderr, "Error: Invalid path specified\n");
+		return NULL;
+	}
+
 	int flags = O_WRONLY | O_BINARY | O_CREAT;
 	if (!force)
 		flags |= O_EXCL;
 
 	/* open and create the file if it doesn't exist already */
 	fd = open(path, flags, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-	FATAL_IF(fd < 0, "cannot create '%s': %s\n", path, strerror(errno));
+	if (fd < 0) {
+		fprintf(stderr, "Error: Cannot create '%s': %s\n", path, strerror(errno));
+		return NULL;
+	}
 
 	/* create the stream from this filedescriptor */
 	f = fdopen(fd, "wb");
 	if (f == NULL) {
 		close(fd);  /* Don't leak file descriptor if fdopen fails */
-		FATAL_IF(1, "cannot create stream for '%s': %s\n",
-			path, strerror(errno));
+		fprintf(stderr, "Error: Cannot create stream for '%s': %s\n", 
+            path, strerror(errno));
+		return NULL;
 	}
 
 	return f;
@@ -109,10 +132,16 @@ static FILE *open_file(const char *path, int force)
 /*
  * close the metainfo file
  */
-static void close_file(FILE *f)
+static int close_file(FILE *f)
 {
+	if (!f) return 0;  /* Accept NULL pointers */
+
 	/* close the metainfo file */
-	FATAL_IF(fclose(f), "cannot close stream: %s\n", strerror(errno));
+	if (fclose(f) != 0) {
+		fprintf(stderr, "Error: Cannot close stream: %s\n", strerror(errno));
+		return -1;
+	}
+	return 0;
 }
 
 /*
@@ -144,6 +173,22 @@ static void display_version(void)
 #endif
 	  "MKTORRENT_MAX_OPENFD         " "%d" "\n"
 	  "MKTORRENT_PROGRESS_PERIOD    " "%d" "\n\n", MAX_OPENFD, PROGRESS_PERIOD);
+}
+
+/*
+ * Count the number of nodes in a linked list
+ */
+static unsigned int count_ll_nodes(struct ll *list)
+{
+	unsigned int count = 0;
+	
+	if (!list) return 0;
+	
+	LL_FOR(node, list) {
+		count++;
+	}
+	
+	return count;
 }
 
 /*
@@ -181,6 +226,10 @@ int main(int argc, char *argv[])
 		0     /* pieces */
 	};
 
+	/* Set up signal handling */
+	signal(SIGINT, handle_signal);
+	signal(SIGTERM, handle_signal);
+
 	/* Print program information */
 	display_version();
 
@@ -194,6 +243,14 @@ int main(int argc, char *argv[])
 
 	/* Process command line options */
 	if (init(&m, argc, argv) != 0) {
+		fprintf(stderr, "Failed to initialize from command line arguments\n");
+		cleanup_metafile(&m);
+		return EXIT_FAILURE;
+	}
+
+	/* Check for interrupt */
+	if (force_exit) {
+		fprintf(stderr, "Operation cancelled by user\n");
 		cleanup_metafile(&m);
 		return EXIT_FAILURE;
 	}
@@ -208,26 +265,35 @@ int main(int argc, char *argv[])
 
 	/* Start measuring time */
 	struct timespec start_time;
-	clock_gettime(CLOCK_MONOTONIC, &start_time);
+	if (clock_gettime(CLOCK_MONOTONIC, &start_time) == -1) {
+		fprintf(stderr, "Failed to get start time: %s\n", strerror(errno));
+	}
 
 	/* Calculate hash string... */
 	hash = make_hash(&m);
-	if (!hash) {
-		fprintf(stderr, "Failed to create hashes\n");
+	if (!hash || force_exit) {
+		if (force_exit) {
+			fprintf(stderr, "Hashing cancelled by user\n");
+		} else {
+			fprintf(stderr, "Failed to create hashes\n");
+		}
 		exit_code = EXIT_FAILURE;
 		goto cleanup;
 	}
 
 	/* Stop measuring time */
 	struct timespec end_time;
-	clock_gettime(CLOCK_MONOTONIC, &end_time);
+	if (clock_gettime(CLOCK_MONOTONIC, &end_time) == -1) {
+		fprintf(stderr, "Failed to get end time: %s\n", strerror(errno));
+	} else {
+		/* Calculate elapsed time */
+		double elapsed = (end_time.tv_sec - start_time.tv_sec) + 
+						(end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
-	/* Calculate elapsed time */
-	double elapsed = (end_time.tv_sec - start_time.tv_sec) + 
-	                (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
-
-	if (m.verbose) {
-		printf("Hashing completed in %.2f seconds\n", elapsed);
+		if (m.verbose) {
+			printf("Hashing completed in %.2f seconds (%.2f MB/s)\n", 
+				elapsed, (m.size / (1024.0 * 1024.0)) / elapsed);
+		}
 	}
 
 	/* Write the metainfo to file */
@@ -239,12 +305,20 @@ int main(int argc, char *argv[])
 
 cleanup:
 	/* Clean up resources */
-	if (file) close_file(file);
+	if (file && close_file(file) != 0) {
+		/* close_file already printed an error message */
+		exit_code = EXIT_FAILURE;
+	}
+	
 	cleanup_metafile(&m);
 	free(hash);
 
 	if (exit_code == EXIT_SUCCESS && m.verbose) {
 		printf("Torrent created successfully: %s\n", m.metainfo_file_path);
+		if (m.target_is_directory) {
+			printf("Files: %u, Total size: %" PRIuMAX " bytes\n", 
+				count_ll_nodes(m.file_list), m.size);
+		}
 	}
 
 	/* Return success or failure */
