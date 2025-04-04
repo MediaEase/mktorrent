@@ -17,6 +17,10 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 */
 
+/* This file should only be compiled if USE_PTHREADS is defined */
+#ifndef USE_PTHREADS
+#error "This file should only be compiled with pthreads support"
+#endif
 
 #include <stdlib.h>       /* exit(), malloc() */
 #include <sys/types.h>    /* off_t */

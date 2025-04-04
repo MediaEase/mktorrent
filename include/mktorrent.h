@@ -50,12 +50,10 @@ struct metafile {
 	int verbose;               /* be verbose */
 	int force_overwrite;       /* overwrite existing output file */
 	struct ll *exclude_list;   /* exclude list */
-#ifdef USE_PTHREADS
 	long threads;              /* number of threads used for hashing */
-#endif
 
 	/* information calculated by read_dir() */
-	uintmax_t size;              /* combined size of all files */
+	uintmax_t size;            /* combined size of all files */
 	struct ll *file_list;      /* list of files and their sizes */
 	unsigned int pieces;       /* number of pieces */
 };
