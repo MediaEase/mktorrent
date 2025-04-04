@@ -30,6 +30,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <time.h>         /* nanosleep() */
 
 #ifdef USE_OPENSSL
+#define OPENSSL_API_COMPAT 0x10100000L
 #include <openssl/sha.h>  /* SHA1() */
 #else
 #include "sha1.h"
