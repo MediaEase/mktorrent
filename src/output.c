@@ -35,6 +35,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include "mktorrent.h"    /* struct metafile */
 #include "output.h"
 
+/* Length of random data for cross-seeding */
+#define CROSS_SEED_RAND_LENGTH 16
 
 /*
  * write announce list
@@ -127,14 +129,20 @@ static void write_web_seed_list(FILE *f, struct ll *list)
  * write metainfo to the file stream using all the information
  * we've gathered so far and the hash string calculated
  */
-EXPORT void write_metainfo(FILE *f, struct metafile *m, unsigned char *hash_string)
+EXPORT int write_metainfo(FILE *f, struct metafile *m, unsigned char *hash_string)
 {
+	int err;
+
 	/* let the user know we've started writing the metainfo file */
 	printf("writing metainfo file... ");
 	fflush(stdout);
 
 	/* every metainfo file is one big dictonary */
-	fprintf(f, "d");
+	err = fprintf(f, "d");
+	if (err < 0) {
+		fprintf(stderr, "Error writing dictionary start\n");
+		return -1;
+	}
 
 	if (!LL_IS_EMPTY(m->announce_list)) {
 
@@ -145,8 +153,12 @@ EXPORT void write_metainfo(FILE *f, struct metafile *m, unsigned char *hash_stri
 		const char *first_announce_url
 			= LL_DATA_AS(LL_HEAD(first_tier), const char*);
 
-		fprintf(f, "8:announce%lu:%s",
+		err = fprintf(f, "8:announce%lu:%s",
 			(unsigned long) strlen(first_announce_url), first_announce_url);
+		if (err < 0) {
+			fprintf(stderr, "Error writing announce URL\n");
+			return -1;
+		}
 
 		/* write the announce-list entry if we have
 		 * more than one announce URL, namely
@@ -227,4 +239,6 @@ EXPORT void write_metainfo(FILE *f, struct metafile *m, unsigned char *hash_stri
 	/* let the user know we're done already */
 	printf("done\n");
 	fflush(stdout);
+
+	return 0;
 }

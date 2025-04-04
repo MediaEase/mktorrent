@@ -24,6 +24,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <stdio.h>       /* printf() etc. */
 #include <sys/stat.h>    /* S_IRUSR, S_IWUSR, S_IRGRP, S_IROTH */
 #include <fcntl.h>       /* open() */
+#include <unistd.h>      /* close(), read() */
 #include <time.h>        /* clock_gettime() */
 
 #include "export.h"
@@ -96,8 +97,11 @@ static FILE *open_file(const char *path, int force)
 
 	/* create the stream from this filedescriptor */
 	f = fdopen(fd, "wb");
-	FATAL_IF(f == NULL, "cannot create stream for '%s': %s\n",
-		path, strerror(errno));
+	if (f == NULL) {
+		close(fd);  /* Don't leak file descriptor if fdopen fails */
+		FATAL_IF(1, "cannot create stream for '%s': %s\n",
+			path, strerror(errno));
+	}
 
 	return f;
 }
@@ -112,11 +116,44 @@ static void close_file(FILE *f)
 }
 
 /*
+ * Display program information, version and build configuration
+ */
+static void display_version(void)
+{
+	printf("mktorrent " VERSION " (c) 2007, 2009 Emil Renner Berthing\n\n"
+	  "Built in " BUILD_CFG " configuration with the following features:\n\n"
+#ifdef USE_LONG_OPTIONS
+	  "MKTORRENT_LONG_OPTIONS       ON\n"
+#else
+	  "MKTORRENT_LONG_OPTIONS       OFF\n"
+#endif
+#ifdef NO_HASH_CHECK
+	  "MKTORRENT_NO_HASH_CHECK      ON\n"
+#else
+	  "MKTORRENT_NO_HASH_CHECK      OFF\n"
+#endif
+#ifdef USE_OPENSSL
+	  "MKTORRENT_OPENSSL            ON\n"
+#else
+	  "MKTORRENT_OPENSSL            OFF\n"
+#endif
+#ifdef USE_PTHREADS
+	  "MKTORRENT_PTHREADS           ON\n"
+#else
+	  "MKTORRENT_PTHREADS           OFF\n"
+#endif
+	  "MKTORRENT_MAX_OPENFD         " "%d" "\n"
+	  "MKTORRENT_PROGRESS_PERIOD    " "%d" "\n\n", MAX_OPENFD, PROGRESS_PERIOD);
+}
+
+/*
  * main().. it starts
  */
 int main(int argc, char *argv[])
 {
-	FILE *file;	/* stream for writing to the metainfo file */
+	FILE *file = NULL;	/* stream for writing to the metainfo file */
+	unsigned char *hash = NULL; /* hash string */
+	int exit_code = EXIT_SUCCESS;
 	struct metafile m = {
 		/* options */
 		0,    /* piece_length, 0 by default indicates length should be calculated automatically */
@@ -144,58 +181,72 @@ int main(int argc, char *argv[])
 		0     /* pieces */
 	};
 
-	/* print information about the program and its build features/configuration */
-	printf("mktorrent " VERSION " (c) 2007, 2009 Emil Renner Berthing\n\n"
-	  "Built in " BUILD_CFG " configuration with the following features:\n\n"
-#ifdef USE_LONG_OPTIONS
-	  "MKTORRENT_LONG_OPTIONS       ON\n"
-#else
-	  "MKTORRENT_LONG_OPTIONS       OFF\n"
-#endif
-#ifdef NO_HASH_CHECK
-	  "MKTORRENT_NO_HASH_CHECK      ON\n"
-#else
-	  "MKTORRENT_NO_HASH_CHECK      OFF\n"
-#endif
-#ifdef USE_OPENSSL
-	  "MKTORRENT_OPENSSL            ON\n"
-#else
-	  "MKTORRENT_OPENSSL            OFF\n"
-#endif
-#ifdef USE_PTHREADS
-	  "MKTORRENT_PTHREADS           ON\n"
-#else
-	  "MKTORRENT_PTHREADS           OFF\n"
-#endif
-	  "MKTORRENT_MAX_OPENFD         " "%d" "\n"
-	  "MKTORRENT_PROGRESS_PERIOD    " "%d" "\n\n", MAX_OPENFD, PROGRESS_PERIOD);
+	/* Print program information */
+	display_version();
 
-	/* seed PRNG with current time */
+	/* Seed PRNG with current time */
 	struct timespec ts;
-	FATAL_IF(clock_gettime(CLOCK_REALTIME, &ts) == -1,
-		"failed to get time: %s\n", strerror(errno));
+	if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+		fprintf(stderr, "Failed to get time: %s\n", strerror(errno));
+		return EXIT_FAILURE;
+	}
 	srandom(ts.tv_nsec ^ ts.tv_sec);
 
-	/* process options */
-	init(&m, argc, argv);
+	/* Process command line options */
+	if (init(&m, argc, argv) != 0) {
+		cleanup_metafile(&m);
+		return EXIT_FAILURE;
+	}
 
 	/* open the file stream now, so we don't have to abort
 	   _after_ we did all the hashing in case we fail */
 	file = open_file(m.metainfo_file_path, m.force_overwrite);
+	if (!file) {
+		cleanup_metafile(&m);
+		return EXIT_FAILURE;
+	}
 
-	/* calculate hash string... */
-	unsigned char *hash = make_hash(&m);
+	/* Start measuring time */
+	struct timespec start_time;
+	clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-	/* and write the metainfo to file */
-	write_metainfo(file, &m, hash);
+	/* Calculate hash string... */
+	hash = make_hash(&m);
+	if (!hash) {
+		fprintf(stderr, "Failed to create hashes\n");
+		exit_code = EXIT_FAILURE;
+		goto cleanup;
+	}
 
-	/* close the file stream */
-	close_file(file);
+	/* Stop measuring time */
+	struct timespec end_time;
+	clock_gettime(CLOCK_MONOTONIC, &end_time);
 
-	/* free allocated memory */
+	/* Calculate elapsed time */
+	double elapsed = (end_time.tv_sec - start_time.tv_sec) + 
+	                (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+
+	if (m.verbose) {
+		printf("Hashing completed in %.2f seconds\n", elapsed);
+	}
+
+	/* Write the metainfo to file */
+	if (write_metainfo(file, &m, hash) != 0) {
+		fprintf(stderr, "Failed to write metainfo file\n");
+		exit_code = EXIT_FAILURE;
+		goto cleanup;
+	}
+
+cleanup:
+	/* Clean up resources */
+	if (file) close_file(file);
 	cleanup_metafile(&m);
 	free(hash);
 
-	/* yeih! everything seemed to go as planned */
-	return EXIT_SUCCESS;
+	if (exit_code == EXIT_SUCCESS && m.verbose) {
+		printf("Torrent created successfully: %s\n", m.metainfo_file_path);
+	}
+
+	/* Return success or failure */
+	return exit_code;
 }

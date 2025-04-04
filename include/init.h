@@ -4,7 +4,7 @@
 #include "export.h"    /* EXPORT */
 #include "mktorrent.h" /* struct metafile */
 
-EXPORT void init(struct metafile *m, int argc, char *argv[]);
 EXPORT void cleanup_metafile(struct metafile *m);
+EXPORT int init(struct metafile *m, int argc, char *argv[]);
 
 #endif /* MKTORRENT_INIT_H */

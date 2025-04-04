@@ -419,7 +419,7 @@ static void free_inner_list(void *data)
  * and fill out the appropriate fields of the
  * metafile structure
  */
-EXPORT void init(struct metafile *m, int argc, char *argv[])
+EXPORT int init(struct metafile *m, int argc, char *argv[])
 {
 	int c;			/* return value of getopt() */
 	const uintmax_t piece_len_maxes[] = {
@@ -471,7 +471,7 @@ EXPORT void init(struct metafile *m, int argc, char *argv[])
 	m->exclude_list = ll_new();
 	FATAL_IF0(m->exclude_list == NULL, "out of memory\n");
 
-	/* now parse the command line options given */
+	/* now parse the command line options */
 #ifdef USE_PTHREADS
 #define OPT_STRING "a:c:e:dDfhl:n:o:ps:t:vw:x"
 #else
@@ -486,12 +486,23 @@ EXPORT void init(struct metafile *m, int argc, char *argv[])
 #undef OPT_STRING
 		switch (c) {
 		case 'a':
-			FATAL_IF0(
-				ll_append(m->announce_list, get_slist(optarg), 0) == NULL,
-				"out of memory\n");
+			if (m->announce_list == NULL) {
+				m->announce_list = ll_new();
+				FATAL_IF0(m->announce_list == NULL, "out of memory\n");
+			}
+
+			if (ll_append(m->announce_list, get_slist(optarg), 0) == NULL) {
+				fprintf(stderr, "Error: failed to add announce URL to list\n");
+				return -1;
+			}
 			break;
 		case 'c':
-			m->comment = optarg;
+			/* Set comment */
+			if (m->comment) {
+				free(m->comment);  /* Free any previous comment */
+			}
+			m->comment = strdup(optarg);
+			FATAL_IF0(m->comment == NULL, "out of memory\n");
 			break;
 		case 'd':
 			m->no_creation_date = 1;
@@ -507,7 +518,7 @@ EXPORT void init(struct metafile *m, int argc, char *argv[])
 			break;
 		case 'h':
 			print_help();
-			exit(EXIT_SUCCESS);
+			return EXIT_SUCCESS;
 		case 'l':
 			m->piece_length = atoi(optarg);
 			break;
@@ -567,6 +578,11 @@ EXPORT void init(struct metafile *m, int argc, char *argv[])
 	if (m->torrent_name == NULL)
 		m->torrent_name = basename(argv[optind]);
 
+	/* if we still don't have a torrent name, default to "unnamed" */
+	if (m->torrent_name == NULL || *m->torrent_name == '\0') {
+		m->torrent_name = "unnamed";
+	}
+
 	/* make sure m->metainfo_file_path is the absolute path to the file */
 	set_absolute_file_path(m);
 
@@ -583,7 +599,7 @@ EXPORT void init(struct metafile *m, int argc, char *argv[])
 			argv[optind], strerror(errno));
 
 		if (file_tree_walk("." DIRSEP, MAX_OPENFD, process_node, m))
-			exit(EXIT_FAILURE);
+			return EXIT_FAILURE;
 	}
 
 	ll_sort(m->file_list, file_data_cmp_by_name);
@@ -616,6 +632,15 @@ EXPORT void init(struct metafile *m, int argc, char *argv[])
 		printf("\n%" PRIuMAX " bytes in all\n"
 			"that's %u pieces of %u bytes each\n\n",
 			m->size, m->pieces, m->piece_length);
+
+	/* check if we have anything to hash */
+	if (argc < optind + 1) {
+		fprintf(stderr, "Error: no input file or directory specified\n");
+		print_help();
+		return -1;
+	}
+
+	return 0;
 }
 
 EXPORT void cleanup_metafile(struct metafile *m)
