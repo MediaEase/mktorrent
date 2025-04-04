@@ -79,8 +79,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #define BUILD_CFG "unspecified_build_type"
 #endif
 
-/* Global flag for handling interrupts */
-static volatile int force_exit = 0;
+/* global variables */
+EXPORT volatile int force_exit = 0;
 
 /* Signal handler for graceful exit */
 static void handle_signal(int signum)
