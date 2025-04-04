@@ -60,6 +60,45 @@ For example, using MSYS2+MinGW64 for a 64-bit build:
 
 5. Build as usual. You may want to link statically with OpenSSL. To do so, pass `-DOPENSSL_USE_STATIC_LIBS=ON` at **configure-time**.
 
+## Testing
+
+The project includes a comprehensive test suite that verifies the functionality of mktorrent. The tests cover everything from basic torrent creation to error handling and performance benchmarks.
+
+### Running the Tests
+
+To run the tests:
+
+```sh
+cd tests
+./run_tests.sh
+```
+
+For performance tests (disabled by default):
+
+```sh
+cd tests
+PERFORMANCE_TESTS=1 ./run_tests.sh
+```
+
+For very large file tests (also disabled by default):
+
+```sh
+cd tests
+PERFORMANCE_TESTS=1 PERFORMANCE_LARGE_TESTS=1 ./run_tests.sh
+```
+
+### Test Categories
+
+The test suite includes the following categories:
+
+- Single file torrent creation
+- Directory/multi-file torrent creation
+- Error handling
+- Interrupt signal handling
+- Performance benchmarks with various configurations
+
+See the [tests/README.md](tests/README.md) file for more details on the test suite.
+
 ### Notes and tips
 
 - It is recommended to do out-of-tree builds. This is the case of the example above, where a `build/` directory is used for build artifacts.
