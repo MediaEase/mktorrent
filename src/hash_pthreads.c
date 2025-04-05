@@ -63,7 +63,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <openssl/sha.h>  /* SHA1() */
 #include <openssl/evp.h>  /* EVP interface for modern SHA1 usage */
 #else
-#include "sha1.h"
+#include "sha1.h"         /* Custom SHA1 implementation */
+/* Define compatibility macros for the custom SHA1 implementation */
+#define sha1_ctx SHA_CTX
+#define sha1_begin SHA1_Init
+#define sha1_hash(data, len, ctx) SHA1_Update((ctx), (data), (len))
+#define sha1_end(digest, ctx) SHA1_Final((digest), (ctx))
 #endif
 
 #include "export.h"

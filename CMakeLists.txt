@@ -68,6 +68,7 @@ target_compile_options(mktorrent PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(mktorrent PRIVATE
     _FILE_OFFSET_BITS=64
     VERSION="${MKTORRENT_VERSION}"
+    BUILD_CFG="${CMAKE_BUILD_TYPE}"
     $<$<BOOL:${MKTORRENT_PTHREADS}>:USE_PTHREADS>
     $<$<BOOL:${MKTORRENT_OPENSSL}>:USE_OPENSSL>
     $<$<BOOL:${MKTORRENT_LONG_OPTIONS}>:USE_LONG_OPTIONS>

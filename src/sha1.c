@@ -71,11 +71,14 @@ static void SHA1_Transform(uint32_t state[5], const uint8_t buffer[64])
 	} CHAR64LONG16;
 	CHAR64LONG16 *block;
 #ifdef SHA1_HANDSOFF
-	static uint8_t workspace[64];
-
-	block = (CHAR64LONG16 *)workspace;
-	memcpy(block, buffer, 64);
+	/* Create local working buffer to avoid modifying the caller's data */
+	CHAR64LONG16 workspace;
+	block = &workspace;
+	
+	/* Safely copy the data to our workspace */
+	memcpy(block->c, buffer, 64);
 #else
+	/* Use the buffer directly - caller guarantees it's properly aligned and valid */
 	block = (CHAR64LONG16 *)buffer;
 #endif
 
@@ -150,14 +153,22 @@ EXPORT void SHA1_Update(SHA_CTX *context, const uint8_t *data, unsigned long len
 	if ((j + len) > 63) {
 		memcpy(&context->buffer[j], data, (i = 64-j));
 		SHA1_Transform(context->state, context->buffer);
-		for ( ; i + 63 < len; i += 64) {
-			SHA1_Transform(context->state, data + i);
+		
+		/* Process complete 64-byte blocks directly from input if we have enough data */
+		for ( ; i + 64 <= len; i += 64) {
+			/* Always use a local copy to avoid buffer overread issues */
+			unsigned char block_copy[64];
+			memcpy(block_copy, data + i, 64);
+			SHA1_Transform(context->state, block_copy);
 		}
 		j = 0;
 	} else
 		i = 0;
 
-	memcpy(&context->buffer[j], &data[i], len - i);
+	/* Copy any remaining bytes to the buffer */
+	if (len - i > 0) {
+		memcpy(&context->buffer[j], &data[i], len - i);
+	}
 
 #ifdef SHA1_VERBOSE
 	SHAPrintContext(context, "after ");
@@ -177,11 +188,16 @@ EXPORT void SHA1_Final(uint8_t *digest, SHA_CTX *context)
 				>> ((3-(i & 3)) * 8)) & 255);
 	}
 
+	/* Add padding: first a 1 bit, then 0 bits until length is 56 mod 64 */
 	SHA1_Update(context, (uint8_t *)"\200", 1);
 	while ((context->count[0] & 504) != 448) {
 		SHA1_Update(context, (uint8_t *)"\0", 1);
 	}
+	
+	/* Add length (before padding) */
 	SHA1_Update(context, finalcount, 8);  /* Should cause a SHA1_Transform() */
+	
+	/* Extract digest bytes from the hash state */
 	for (i = 0; i < SHA_DIGEST_LENGTH; i++) {
 		digest[i] = (uint8_t)
 			((context->state[i>>2] >> ((3-(i & 3)) * 8)) & 255);
@@ -196,7 +212,9 @@ EXPORT void SHA1_Final(uint8_t *digest, SHA_CTX *context)
 #endif
 
 #ifdef SHA1_HANDSOFF /* make SHA1Transform overwrite its own static vars */
-	SHA1_Transform(context->state, context->buffer);
+	/* Only do this if we have a complete block ready */
+	if ((context->count[0] & 63) == 0)
+		SHA1_Transform(context->state, context->buffer);
 #endif
 }
 
