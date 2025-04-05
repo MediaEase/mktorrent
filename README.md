@@ -1,6 +1,6 @@
 # mktorrent
 
-![Github Actions CI CD](https://github.com/FranciscoPombal/mktorrent/workflows/Github%20Actions%20CI%20CD/badge.svg)
+![Github Actions CI CD](https://github.com/MediaEase/mktorrent-builds/workflows/Github%20Actions%20CI%20CD/badge.svg)
 
 mktorrent is a simple command-line utility to create BitTorrent metainfo files, written in C.
 
