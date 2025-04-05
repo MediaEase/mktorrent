@@ -36,6 +36,29 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <signal.h>
 #include <sys/mman.h>     /* mmap(), munmap() */
 
+/* Define _GNU_SOURCE before including sched.h */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <sched.h>        /* CPU_SET, CPU_ZERO, etc. */
+#include <sys/resource.h> /* getrlimit, setrlimit */
+
+/* Include pthread_np.h for pthread_setaffinity_np on some systems */
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <pthread_np.h>
+#endif
+
+/* Linux-specific AIO - disabled since libaio.h isn't available */
+/* 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <libaio.h>
+#define USE_AIO
+#define AIO_MAX_EVENTS 32
+#define AIO_LARGE_FILE_THRESHOLD (50 * 1024 * 1024)
+#endif
+*/
+
 #ifdef USE_OPENSSL
 #include <openssl/sha.h>  /* SHA1() */
 #include <openssl/evp.h>  /* EVP interface for modern SHA1 usage */
@@ -56,15 +79,25 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #define O_BINARY 0
 #endif
 
+#ifndef O_DIRECT
+#define O_DIRECT 0
+#endif
+
 #define OPENFLAGS (O_RDONLY | O_BINARY)
+#define DIRECT_IO_THRESHOLD (100 * 1024 * 1024) /* 100MB */
 #define MIN_READ_SIZE (64 * 1024)  /* 64KB minimum read size */
 #define MAX_READ_SIZE (4 * 1024 * 1024) /* 4MB maximum read size */
 #define MAX_BUFFERS_PER_THREAD 4   /* Maximum buffers per thread */
+#define MAX_RETRY_COUNT 3          /* Number of retries for I/O operations */
+#define RETRY_DELAY_BASE 50000     /* Base microseconds delay between retries (50ms) */
 
 /* Recommended size threshold to use mmap instead of read */
 #define MMAP_THRESHOLD (10 * 1024 * 1024) /* 10MB */
 
 #define PREFETCH_QUEUE_SIZE 2  /* Number of files to prefetch ahead */
+
+#define DEFAULT_MAX_MEMORY_PERCENT 75  /* Default maximum memory usage (% of available) */
+#define MIN_MEMORY_PER_THREAD (10 * 1024 * 1024)  /* Minimum 10MB per thread */
 
 /* External declaration of the force_exit flag for clean shutdowns */
 extern volatile int force_exit;
@@ -89,6 +122,7 @@ struct queue {
 	unsigned int pieces;
 	unsigned int pieces_hashed;
 	int verbose;
+	int cleanup_in_progress; /* Flag to indicate cleanup is in progress */
 };
 
 /* Structure to hold prefetched file data */
@@ -103,447 +137,139 @@ struct prefetch_data {
     pthread_cond_t cond;
 };
 
-static struct piece *get_free(struct queue *q, size_t piece_length)
-{
-	struct piece *r;
+#ifdef USE_AIO
+/* Structure to hold AIO context and request information */
+struct aio_context {
+    io_context_t ctx;
+    struct iocb *iocbs[AIO_MAX_EVENTS];
+    struct iocb iocb_list[AIO_MAX_EVENTS];
+    struct io_event events[AIO_MAX_EVENTS];
+    unsigned char *buffers[AIO_MAX_EVENTS];
+    int num_requests;
+    int max_requests;
+    size_t block_size;
+    int active;
+};
 
-	pthread_mutex_lock(&q->mutex_free);
-	if (q->free) {
-		r = q->free;
-		q->free = r->next;
-	} else if (q->buffers < q->buffers_max) {
-		/* Allocate aligned memory for better cache performance */
-		size_t alloc_size = sizeof(struct piece) - 1 + piece_length;
-		
-		/* Align to cache line boundary (typically 64 bytes) */
-		#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-			/* Use posix_memalign for aligned allocation */
-			void *mem = NULL;
-			if (posix_memalign(&mem, 64, alloc_size) != 0) {
-				fprintf(stderr, "Error: Failed to allocate aligned memory\n");
-				r = NULL;
-			} else {
-				r = (struct piece *)mem;
-			}
-		#else
-			/* Fallback for systems without posix_memalign */
-			/* Add extra space for alignment */
-			void *mem = malloc(alloc_size + 64);
-			if (mem == NULL) {
-				r = NULL;
-			} else {
-				/* Align to 64-byte boundary */
-				uintptr_t addr = (uintptr_t)mem;
-				addr = (addr + 63) & ~(uintptr_t)63; /* Round up to 64-byte boundary */
-				r = (struct piece *)addr;
+/* Initialize AIO context */
+static int init_aio_context(struct aio_context *aio_ctx, int max_requests, size_t block_size)
+{
+    memset(aio_ctx, 0, sizeof(struct aio_context));
+    
+    /* Initialize the AIO context */
+    memset(&aio_ctx->ctx, 0, sizeof(io_context_t));
+    if (io_setup(max_requests, &aio_ctx->ctx) != 0) {
+        fprintf(stderr, "Warning: io_setup failed: %s\n", strerror(errno));
+        return -1;
+    }
 				
-				/* Store original pointer for freeing later */
-				*((void **)r - 1) = mem;
-			}
-		#endif
-		
-		FATAL_IF0(r == NULL, "out of memory\n");
-		q->buffers++;
-	} else {
-		while (q->free == NULL) {
-			pthread_cond_wait(&q->cond_full, &q->mutex_free);
-		}
-
-		r = q->free;
-		q->free = r->next;
-	}
-	pthread_mutex_unlock(&q->mutex_free);
-
-	return r;
+    aio_ctx->max_requests = (max_requests < AIO_MAX_EVENTS) ? max_requests : AIO_MAX_EVENTS;
+    aio_ctx->block_size = block_size;
+    aio_ctx->num_requests = 0;
+    aio_ctx->active = 1;
+    
+    /* Allocate aligned buffers for AIO operations */
+    for (int i = 0; i < aio_ctx->max_requests; i++) {
+        void *buf = NULL;
+        if (posix_memalign(&buf, 512, block_size) != 0) {
+            fprintf(stderr, "Warning: Failed to allocate aligned buffer for AIO\n");
+            aio_ctx->buffers[i] = NULL;
+        } else {
+            aio_ctx->buffers[i] = buf;
+        }
+        aio_ctx->iocbs[i] = &aio_ctx->iocb_list[i];
+    }
+    
+    return 0;
 }
 
-static struct piece *get_full(struct queue *q)
+/* Clean up AIO context resources */
+static void cleanup_aio_context(struct aio_context *aio_ctx)
 {
-	struct piece *r;
-
-	pthread_mutex_lock(&q->mutex_full);
-again:
-	if (q->full) {
-		r = q->full;
-		q->full = r->next;
-	} else if (q->done) {
-		r = NULL;
-	} else {
-		pthread_cond_wait(&q->cond_empty, &q->mutex_full);
-		goto again;
-	}
-	pthread_mutex_unlock(&q->mutex_full);
-
-	return r;
+    /* Wait for any pending requests */
+    if (aio_ctx->num_requests > 0) {
+        struct timespec timeout = { 1, 0 }; /* 1 second timeout */
+        io_getevents(aio_ctx->ctx, aio_ctx->num_requests, aio_ctx->max_requests, 
+                     aio_ctx->events, &timeout);
+    }
+    
+    /* Destroy the AIO context */
+    io_destroy(aio_ctx->ctx);
+    
+    /* Free the aligned buffers */
+    for (int i = 0; i < aio_ctx->max_requests; i++) {
+        free(aio_ctx->buffers[i]);
+    }
+    
+    aio_ctx->active = 0;
 }
 
-static void put_free(struct queue *q, struct piece *p, unsigned int hashed)
+/* Submit a read request to the AIO context */
+static int submit_aio_read(struct aio_context *aio_ctx, int fd, 
+                          off_t offset, size_t length, int buffer_idx)
 {
-	pthread_mutex_lock(&q->mutex_free);
-	p->next = q->free;
-	q->free = p;
-	q->pieces_hashed += hashed;
-	pthread_mutex_unlock(&q->mutex_free);
-	pthread_cond_signal(&q->cond_full);
+    if (buffer_idx >= aio_ctx->max_requests || aio_ctx->buffers[buffer_idx] == NULL) {
+        return -1;
+    }
+    
+    /* Prepare the I/O control block */
+    struct iocb *iocb = aio_ctx->iocbs[buffer_idx];
+    io_prep_pread(iocb, fd, aio_ctx->buffers[buffer_idx], length, offset);
+    
+    /* Submit the request */
+    if (io_submit(aio_ctx->ctx, 1, &iocb) != 1) {
+        fprintf(stderr, "Warning: io_submit failed: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    aio_ctx->num_requests++;
+    return 0;
 }
 
-static void put_full(struct queue *q, struct piece *p)
+/* Wait for AIO requests to complete and process them */
+static int process_aio_events(struct aio_context *aio_ctx, struct piece *p, size_t *r_ptr)
 {
-	pthread_mutex_lock(&q->mutex_full);
-	p->next = q->full;
-	q->full = p;
-	pthread_mutex_unlock(&q->mutex_full);
-	pthread_cond_signal(&q->cond_empty);
+    int completed = 0;
+    struct timespec timeout = { 0, 10000000 }; /* 10ms timeout */
+    
+    /* Wait for at least one event to complete */
+    int num_events = io_getevents(aio_ctx->ctx, 1, aio_ctx->max_requests, 
+                                  aio_ctx->events, &timeout);
+    
+    if (num_events < 0) {
+        fprintf(stderr, "Warning: io_getevents failed: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    /* Process completed events */
+    for (int i = 0; i < num_events; i++) {
+        struct io_event *event = &aio_ctx->events[i];
+        struct iocb *iocb = (struct iocb *)event->obj;
+        int buffer_idx = iocb - aio_ctx->iocb_list;
+        
+        if (event->res < 0) {
+            fprintf(stderr, "Warning: AIO read failed: %s\n", strerror(-event->res));
+            continue;
+        }
+        
+        /* Copy data from AIO buffer to piece buffer */
+        size_t bytes_read = event->res;
+        if (bytes_read > 0) {
+            memcpy(p->data + *r_ptr, aio_ctx->buffers[buffer_idx], bytes_read);
+            *r_ptr += bytes_read;
+            completed++;
+        }
+    }
+    
+    /* Update the number of pending requests */
+    aio_ctx->num_requests -= num_events;
+    return completed;
 }
 
-static void set_done(struct queue *q)
-{
-	pthread_mutex_lock(&q->mutex_full);
-	q->done = 1;
-	pthread_mutex_unlock(&q->mutex_full);
-	pthread_cond_broadcast(&q->cond_empty);
-}
-
-static void free_buffers(struct queue *q)
-{
-	struct piece *current = q->free;
-	struct piece *next;
-
-	while (current) {
-		next = current->next;
-		
-		#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-			/* For posix_memalign, just free the pointer directly */
-			free(current);
-		#else
-			/* For custom alignment, get the original pointer first */
-			void *original = *((void **)current - 1);
-			free(original);
-		#endif
-		
-		current = next;
-	}
-
-	/* Also free any pieces in the full queue that weren't processed */
-	current = q->full;
-	while (current) {
-		next = current->next;
-		
-		#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-			free(current);
-		#else
-			void *original = *((void **)current - 1);
-			free(original);
-		#endif
-		
-		current = next;
-	}
-
-	q->free = NULL;
-	q->full = NULL;
-}
-
-/*
- * print the progress in a thread of its own
- */
-static void *print_progress(void *data)
-{
-	struct queue *q = data;
-	int err;
-	struct timespec t;
-	unsigned int last_pieces_hashed = 0;
-	unsigned int current_speed = 0;
-	time_t last_update_time = time(NULL);
-	time_t start_time = last_update_time;
-	size_t piece_length = 0;  /* We'll set this from the metafile */
-	uintmax_t bytes_per_second = 0;
-	uintmax_t total_bytes = 0;
-	double eta_seconds = 0;
-	
-	/* Find out the piece length by checking a piece buffer */
-	pthread_mutex_lock(&q->mutex_full);
-	if (q->full) {
-		piece_length = q->full->len;
-	} else {
-		pthread_mutex_lock(&q->mutex_free);
-		if (q->free) {
-			piece_length = q->free->len;
-		}
-		pthread_mutex_unlock(&q->mutex_free);
-	}
-	pthread_mutex_unlock(&q->mutex_full);
-
-	t.tv_sec = PROGRESS_PERIOD / 1000000;
-	t.tv_nsec = PROGRESS_PERIOD % 1000000 * 1000;
-
-	err = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-	if (err) {
-		fprintf(stderr, "Warning: Cannot set thread cancel type: %s\n", strerror(err));
-	}
-
-	while (1) {
-		/* Calculate hashing speed and ETA */
-		time_t current_time = time(NULL);
-		time_t elapsed = current_time - last_update_time;
-		time_t total_elapsed = current_time - start_time;
-		
-		if (elapsed >= 1) {
-			unsigned int pieces_done = q->pieces_hashed - last_pieces_hashed;
-			current_speed = pieces_done / elapsed;
-			
-			/* Calculate bytes per second if we know the piece length */
-			if (piece_length > 0 && current_speed > 0) {
-				bytes_per_second = (uintmax_t)current_speed * piece_length;
-				total_bytes = (uintmax_t)q->pieces_hashed * piece_length;
-			}
-			
-			/* Calculate ETA */
-			if (current_speed > 0 && q->pieces > 0) {
-				unsigned int pieces_left = q->pieces - q->pieces_hashed;
-				eta_seconds = (double)pieces_left / current_speed;
-			}
-			
-			last_pieces_hashed = q->pieces_hashed;
-			last_update_time = current_time;
-		}
-
-		/* print progress and flush the buffer immediately */
-		float percentage = q->pieces > 0 ? 
-			(float)q->pieces_hashed * 100 / q->pieces : 0;
-			
-		/* Display remaining time in appropriate units */
-		char eta_str[50] = "calculating...";
-		if (current_speed > 0) {
-			if (eta_seconds < 60) {
-				snprintf(eta_str, sizeof(eta_str), "%.0fs", eta_seconds);
-			} else if (eta_seconds < 3600) {
-				snprintf(eta_str, sizeof(eta_str), "%.1fm", eta_seconds / 60);
-			} else {
-				snprintf(eta_str, sizeof(eta_str), "%.1fh", eta_seconds / 3600);
-			}
-		}
-		
-		/* Format throughput in appropriate units */
-		char speed_str[50] = "";
-		if (bytes_per_second > 0) {
-			if (bytes_per_second < 1024 * 1024) {
-				snprintf(speed_str, sizeof(speed_str), " at %.1f KB/s", 
-					bytes_per_second / 1024.0);
-			} else {
-				snprintf(speed_str, sizeof(speed_str), " at %.2f MB/s", 
-					bytes_per_second / (1024.0 * 1024.0));
-			}
-		}
-		
-		/* Show elapsed time and total bytes processed */
-		char elapsed_str[100] = "";
-		if (total_elapsed > 0) {
-			char time_part[50];
-			char bytes_part[50] = "";
-			
-			if (total_elapsed < 60) {
-				snprintf(time_part, sizeof(time_part), "[%lds]", total_elapsed);
-			} else if (total_elapsed < 3600) {
-				snprintf(time_part, sizeof(time_part), "[%ldm %lds]", 
-					total_elapsed / 60, total_elapsed % 60);
-			} else {
-				snprintf(time_part, sizeof(time_part), "[%ldh %ldm]", 
-					total_elapsed / 3600, (total_elapsed % 3600) / 60);
-			}
-			
-			if (total_bytes > 0) {
-				if (total_bytes < 1024 * 1024) {
-					snprintf(bytes_part, sizeof(bytes_part), " %.1f KB", 
-						total_bytes / 1024.0);
-				} else if (total_bytes < 1024 * 1024 * 1024) {
-					snprintf(bytes_part, sizeof(bytes_part), " %.2f MB", 
-						total_bytes / (1024.0 * 1024.0));
-				} else {
-					snprintf(bytes_part, sizeof(bytes_part), " %.2f GB", 
-						total_bytes / (1024.0 * 1024.0 * 1024.0));
-				}
-			}
-			
-			snprintf(elapsed_str, sizeof(elapsed_str), " %s%s", time_part, bytes_part);
-		}
-		
-		if (q->verbose) {
-			printf("\rHashed %u of %u pieces (%.1f%%)%s%s - ETA: %s  ", 
-				q->pieces_hashed, q->pieces, percentage,
-				speed_str, elapsed_str, eta_str);
-		} else {
-			printf("\rHashed %u of %u pieces.", q->pieces_hashed, q->pieces);
-		}
-		fflush(stdout);
-		
-		/* now sleep for PROGRESS_PERIOD microseconds */
-		nanosleep(&t, NULL);
-	}
-
-	return NULL;
-}
-
-static void *worker(void *data)
-{
-	struct queue *q = data;
-	struct piece *p;
-#ifdef USE_OPENSSL
-	/* Use the modern EVP API when OpenSSL is available */
-	EVP_MD_CTX *ctx = NULL;
-	const EVP_MD *md = NULL;
-	unsigned int md_len = 0;
-	
-	/* Initialize the EVP context */
-	ctx = EVP_MD_CTX_new();
-	if (!ctx) {
-		fprintf(stderr, "Error: Failed to create EVP context\n");
-		return NULL;
-	}
-	
-	/* Get the SHA1 message digest */
-	md = EVP_sha1();
-	if (!md) {
-		fprintf(stderr, "Error: Failed to get SHA1 digest\n");
-		EVP_MD_CTX_free(ctx);
-		return NULL;
-	}
-#else
-	SHA_CTX c;
-#endif
-
-	/* Use cache-aligned buffer for output to avoid false sharing */
-	unsigned char hash_buffer[SHA_DIGEST_LENGTH] __attribute__((aligned(64)));
-
-	while ((p = get_full(q))) {
-		/* Process data in chunks that fit better in CPU cache */
-		const size_t OPTIMAL_CHUNK_SIZE = 65536; /* 64KB - good balance for cache efficiency */
-		size_t remaining = p->len;
-		size_t offset = 0;
-
-#ifdef USE_OPENSSL
-		/* Initialize the hash context */
-		if (EVP_DigestInit_ex(ctx, md, NULL) != 1) {
-			fprintf(stderr, "Error: Failed to initialize SHA1 hash\n");
-			put_free(q, p, 1); /* Still mark as processed */
-			continue;
-		}
-		
-		/* Process the data in cache-friendly chunks */
-		while (remaining > 0) {
-			size_t chunk_size = (remaining > OPTIMAL_CHUNK_SIZE) ? 
-								 OPTIMAL_CHUNK_SIZE : remaining;
-			
-			if (EVP_DigestUpdate(ctx, p->data + offset, chunk_size) != 1) {
-				fprintf(stderr, "Error: Failed during SHA1 update\n");
-				break;
-			}
-			
-			offset += chunk_size;
-			remaining -= chunk_size;
-		}
-		
-		/* Finalize the hash and store in aligned buffer first */
-		if (EVP_DigestFinal_ex(ctx, hash_buffer, &md_len) != 1) {
-			fprintf(stderr, "Error: Failed to finalize SHA1 hash\n");
-		}
-		
-		/* Copy to destination */
-		memcpy(p->dest, hash_buffer, SHA_DIGEST_LENGTH);
-#else
-		/* Initialize the hash context */
-		SHA1_Init(&c);
-		
-		/* Process the data in cache-friendly chunks */
-		while (remaining > 0) {
-			size_t chunk_size = (remaining > OPTIMAL_CHUNK_SIZE) ? 
-								 OPTIMAL_CHUNK_SIZE : remaining;
-			
-			SHA1_Update(&c, p->data + offset, chunk_size);
-			
-			offset += chunk_size;
-			remaining -= chunk_size;
-		}
-		
-		/* Finalize the hash and store in aligned buffer first */
-		SHA1_Final(hash_buffer, &c);
-		
-		/* Copy to destination */
-		memcpy(p->dest, hash_buffer, SHA_DIGEST_LENGTH);
-#endif
-
-		put_free(q, p, 1);
-	}
-
-#ifdef USE_OPENSSL
-	/* Clean up EVP context */
-	EVP_MD_CTX_free(ctx);
-#endif
-
-	return NULL;
-}
-
-/*
- * Get optimal block size for a file
- */
-static size_t get_optimal_block_size(int fd)
-{
-	struct stat file_stat;
-	size_t block_size = MIN_READ_SIZE;
-	
-	if (fstat(fd, &file_stat) == 0) {
-		/* Get file system's preferred block size */
-		if (file_stat.st_blksize > MIN_READ_SIZE) {
-			block_size = file_stat.st_blksize;
-		}
-		
-		/* Cap the block size at a reasonable maximum */
-		if (block_size > MAX_READ_SIZE) {
-			block_size = MAX_READ_SIZE;
-		}
-	}
-	
-	return block_size;
-}
-
-/*
- * Reads data from fd into buffer, handling partial reads and retrying on interrupts
- * Returns total bytes read, or -1 on error
- */
-static ssize_t robust_read(int fd, unsigned char *buf, size_t count)
-{
-	ssize_t total_read = 0;
-	ssize_t bytes_read;
-	
-	while (count > 0) {
-		bytes_read = read(fd, buf, count);
-		
-		if (bytes_read < 0) {
-			/* EINTR means we were interrupted by a signal */
-			if (errno == EINTR)
-				continue;
-			
-			/* Real error occurred */
-			return -1;
-		}
-		
-		if (bytes_read == 0) /* End of file */
-			break;
-		
-		buf += bytes_read;
-		count -= bytes_read;
-		total_read += bytes_read;
-	}
-	
-	return total_read;
-}
-
-/*
- * Process a file using memory mapping for large files, or read() for smaller ones
- * Returns 0 on success, -1 on error
- */
-static int process_file(struct file_data *f, struct metafile *m, 
-                       struct queue *q, unsigned char **pos_ptr,
-                       size_t *r_ptr, struct piece **p_ptr)
+/* Process a file using AIO */
+static int process_file_aio(struct file_data *f, struct metafile *m, 
+                           struct queue *q, unsigned char **pos_ptr,
+                           size_t *r_ptr, struct piece **p_ptr)
 {
     int fd;
     size_t r = *r_ptr;
@@ -551,9 +277,479 @@ static int process_file(struct file_data *f, struct metafile *m,
     unsigned char *pos = *pos_ptr;
     int result = 0;
     
-    /* open the current file for reading */
-    fd = open(f->path, OPENFLAGS);
+    /* Open the file for reading */
+    fd = open(f->path, O_RDONLY | O_DIRECT);
     if (fd == -1) {
+        /* Try without O_DIRECT */
+        fd = open(f->path, O_RDONLY);
+        if (fd == -1) {
+            fprintf(stderr, "Error: Cannot open '%s' for reading: %s\n",
+                    f->path, strerror(errno));
+            return -1;
+        }
+    }
+    
+    /* Get file stats */
+    struct stat file_stat;
+    if (fstat(fd, &file_stat) != 0) {
+        fprintf(stderr, "Error: Cannot stat '%s': %s\n",
+                f->path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    
+    /* Apply file access pattern hints */
+    apply_file_access_hints(fd, file_stat.st_size);
+    
+    /* Verbose output */
+    if (m->verbose) {
+        printf("\rProcessing file (AIO): %s (%" PRIuMAX " bytes)      ", 
+               f->path, f->size);
+        fflush(stdout);
+    }
+    
+    /* Initialize AIO context */
+    struct aio_context aio_ctx;
+    size_t block_size = get_optimal_block_size(fd);
+    if (init_aio_context(&aio_ctx, AIO_MAX_EVENTS, block_size) != 0) {
+        fprintf(stderr, "Warning: Failed to initialize AIO context, falling back to standard I/O\n");
+        close(fd);
+        return process_file(f, m, q, pos_ptr, r_ptr, p_ptr);
+    }
+    
+    /* Process the file using AIO */
+    size_t file_size = file_stat.st_size;
+    off_t offset = 0;
+    int buffer_idx = 0;
+    
+    /* Submit initial batch of read requests */
+    while (offset < file_size && buffer_idx < aio_ctx.max_requests) {
+        size_t to_read = (block_size < file_size - offset) ? 
+                         block_size : (file_size - offset);
+        
+        if (submit_aio_read(&aio_ctx, fd, offset, to_read, buffer_idx) == 0) {
+            offset += to_read;
+            buffer_idx = (buffer_idx + 1) % aio_ctx.max_requests;
+        } else {
+            break;
+        }
+    }
+    
+    /* Process events and submit new requests */
+    while (aio_ctx.num_requests > 0 || offset < file_size) {
+        /* Process completed events */
+        if (process_aio_events(&aio_ctx, p, &r) < 0) {
+            result = -1;
+            break;
+        }
+        
+        /* Submit more requests if there's more data to read */
+        while (offset < file_size && aio_ctx.num_requests < aio_ctx.max_requests) {
+            size_t to_read = (block_size < file_size - offset) ? 
+                             block_size : (file_size - offset);
+            
+            if (submit_aio_read(&aio_ctx, fd, offset, to_read, buffer_idx) == 0) {
+                offset += to_read;
+                buffer_idx = (buffer_idx + 1) % aio_ctx.max_requests;
+            } else {
+                break;
+            }
+        }
+        
+        /* Check if we filled a piece */
+        if (r == m->piece_length) {
+            p->dest = pos;
+            p->len = m->piece_length;
+            put_full(q, p);
+            pos += SHA_DIGEST_LENGTH;
+            r = 0;
+            
+            /* Check if we should abort due to user interrupt */
+            if (force_exit) {
+                result = -1;
+                break;
+            }
+            
+            /* Get a new piece buffer */
+            p = get_free(q, m->piece_length);
+        }
+        
+        /* Check for user interruption */
+        if (force_exit) {
+            result = -1;
+            break;
+        }
+    }
+    
+    /* Clean up AIO resources */
+    cleanup_aio_context(&aio_ctx);
+    close(fd);
+    
+    /* Update the caller's variables */
+    *r_ptr = r;
+    *p_ptr = p;
+    *pos_ptr = pos;
+    return result;
+}
+#endif /* USE_AIO */
+
+/* Queue management functions */
+
+/* Set queue to done state */
+static void set_done(struct queue *q)
+{
+    pthread_mutex_lock(&q->mutex_full);
+    q->done = 1;
+    pthread_mutex_unlock(&q->mutex_full);
+    pthread_cond_broadcast(&q->cond_full);
+}
+
+/* Get a free piece from the queue */
+static struct piece *get_free(struct queue *q, size_t piece_length __attribute__((unused)))
+{
+    struct piece *p;
+    struct timespec ts;
+    int rc;
+
+    pthread_mutex_lock(&q->mutex_free);
+
+    /* Set timeout to 30 seconds to prevent indefinite waiting */
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 30;  /* 30 second timeout */
+
+    while (q->free == NULL) {
+        /* Use timed wait to prevent endless blocking */
+        rc = pthread_cond_timedwait(&q->cond_empty, &q->mutex_free, &ts);
+        if (rc == ETIMEDOUT) {
+            fprintf(stderr, "Warning: Timed out waiting for free buffer\n");
+            pthread_mutex_unlock(&q->mutex_free);
+            return NULL;  /* Return NULL after timeout */
+        }
+    }
+
+    p = q->free;
+    q->free = p->next;
+
+    pthread_mutex_unlock(&q->mutex_free);
+
+    return p;
+}
+
+/* Add a piece to the free queue */
+static void put_free(struct queue *q, struct piece *p, int unlock_mutex)
+{
+    p->next = q->free;
+    q->free = p;
+
+    if (unlock_mutex)
+        pthread_mutex_unlock(&q->mutex_free);
+    else
+        pthread_cond_signal(&q->cond_empty);
+}
+
+/* Add a piece to the full queue */
+static void put_full(struct queue *q, struct piece *p)
+{
+    pthread_mutex_lock(&q->mutex_full);
+    p->next = q->full;
+    q->full = p;
+    pthread_mutex_unlock(&q->mutex_full);
+    pthread_cond_signal(&q->cond_full);
+}
+
+/* Free all allocated buffers */
+static void free_buffers(struct queue *q)
+{
+    struct piece *p = q->free;
+    struct piece *next;
+    
+    /* Mark that cleanup is in progress to prevent threads from accessing freed memory */
+    q->cleanup_in_progress = 1;
+
+    while (p) {
+        next = p->next;
+        free(p);
+        p = next;
+    }
+    q->free = NULL;
+
+    p = q->full;
+    while (p) {
+        next = p->next;
+        free(p);
+        p = next;
+    }
+    q->full = NULL;
+}
+
+/* Get optimal block size for a file descriptor */
+static size_t get_optimal_block_size(int fd)
+{
+    struct stat st;
+    size_t block_size = MAX_READ_SIZE;
+
+    if (fstat(fd, &st) == 0 && st.st_blksize > 0) {
+        block_size = st.st_blksize;
+        
+        /* Align block size to common page sizes */
+        if (block_size < MIN_READ_SIZE)
+            block_size = MIN_READ_SIZE;
+        else if (block_size > MAX_READ_SIZE)
+            block_size = MAX_READ_SIZE;
+    }
+
+    return block_size;
+}
+
+/* Robust read implementation that handles interruptions and partial reads */
+static ssize_t robust_read(int fd, void *buf, size_t count)
+{
+    size_t total = 0;
+    ssize_t n;
+
+    while (total < count) {
+        n = read(fd, (unsigned char *)buf + total, count - total);
+        
+        if (n == 0) /* EOF */
+            break;
+            
+        if (n == -1) {
+            if (errno == EINTR)
+                continue; /* Interrupted, try again */
+            return -1;    /* Real error */
+        }
+        
+        total += n;
+    }
+    
+    return total;
+}
+
+/* Apply file access hints to improve read performance */
+static void apply_file_access_hints(int fd, size_t file_size)
+{
+#ifdef POSIX_FADV_SEQUENTIAL
+    /* Tell the kernel we're accessing the file sequentially */
+    if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL) != 0) {
+        fprintf(stderr, "Warning: posix_fadvise(SEQUENTIAL) failed: %s\n", strerror(errno));
+    }
+    
+    /* For large files, also request the kernel to read ahead */
+    if (file_size > 10 * 1024 * 1024) { /* 10MB */
+        if (posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED) != 0) {
+            fprintf(stderr, "Warning: posix_fadvise(WILLNEED) failed: %s\n", strerror(errno));
+        }
+    }
+#endif
+}
+
+/* Worker thread function that processes the pieces in the queue */
+static void *worker(void *arg)
+{
+    struct queue *q = (struct queue *)arg;
+    struct piece *p;
+    struct timespec ts;
+    int rc;
+
+    while (1) {
+        /* Get a piece from the full queue */
+        pthread_mutex_lock(&q->mutex_full);
+        
+        /* Check if cleanup is in progress */
+        if (q->cleanup_in_progress) {
+            pthread_mutex_unlock(&q->mutex_full);
+            return NULL;
+        }
+        
+        /* Set timeout to 30 seconds to prevent indefinite waiting */
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 30;  /* 30 second timeout */
+        
+        while (q->full == NULL && !q->done) {
+            /* Use timed wait to prevent endless blocking */
+            rc = pthread_cond_timedwait(&q->cond_full, &q->mutex_full, &ts);
+            if (rc == ETIMEDOUT) {
+                fprintf(stderr, "Warning: Worker thread timed out waiting for data\n");
+                pthread_mutex_unlock(&q->mutex_full);
+                return NULL;  /* Exit thread after timeout */
+            }
+            
+            /* Check if cleanup started during wait */
+            if (q->cleanup_in_progress) {
+                pthread_mutex_unlock(&q->mutex_full);
+                return NULL;
+            }
+        }
+
+        if (q->full == NULL && q->done) {
+            pthread_mutex_unlock(&q->mutex_full);
+            return NULL;
+        }
+
+        p = q->full;
+        q->full = p->next;
+        pthread_mutex_unlock(&q->mutex_full);
+
+        /* Check if cleanup started */
+        if (q->cleanup_in_progress) {
+            return NULL;
+        }
+
+        /* Calculate the SHA1 hash */
+#ifdef USE_OPENSSL
+        SHA1(p->data, p->len, p->dest);
+#else
+        sha1_ctx ctx;
+        sha1_begin(&ctx);
+        sha1_hash(p->data, p->len, &ctx);
+        sha1_end(p->dest, &ctx);
+#endif
+
+        /* Return piece to the free queue */
+        pthread_mutex_lock(&q->mutex_free);
+        /* Check if cleanup started */
+        if (q->cleanup_in_progress) {
+            pthread_mutex_unlock(&q->mutex_free);
+            return NULL;
+        }
+        
+        p->next = q->free;
+        q->free = p;
+        q->pieces_hashed++;
+        pthread_mutex_unlock(&q->mutex_free);
+        pthread_cond_signal(&q->cond_empty);
+    }
+
+    return NULL;
+}
+
+/* Thread function that displays progress information */
+static void *print_progress(void *arg)
+{
+    struct queue *q = (struct queue *)arg;
+    int percent_complete;
+    struct timespec req = {0, 0};
+    
+    /* Setup for clean thread cancellation */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+
+    req.tv_sec = 0;
+    req.tv_nsec = PROGRESS_PERIOD * 1000;
+
+    while (1) {
+        /* Check if cleanup is in progress */
+        if (q->cleanup_in_progress) {
+            return NULL;
+        }
+        
+        /* Set a cancellation point */
+        pthread_testcancel();
+        
+        nanosleep(&req, NULL);
+
+        /* Set another cancellation point */
+        pthread_testcancel();
+        
+        /* Check again if cleanup is in progress */
+        if (q->cleanup_in_progress) {
+            return NULL;
+        }
+
+        pthread_mutex_lock(&q->mutex_free);
+        /* Check if cleanup started while waiting for lock */
+        if (q->cleanup_in_progress) {
+            pthread_mutex_unlock(&q->mutex_free);
+            return NULL;
+        }
+        
+        if (q->pieces) {
+            percent_complete = (q->pieces_hashed * 100) / q->pieces;
+            printf("\rHashing: %d%%", percent_complete);
+            fflush(stdout);
+        }
+        
+        if (q->done && q->pieces_hashed == q->pieces) {
+            pthread_mutex_unlock(&q->mutex_free);
+            printf("\rHashing: 100%%\n");
+            fflush(stdout);
+            return NULL;
+        }
+        pthread_mutex_unlock(&q->mutex_free);
+    }
+
+    return NULL;
+}
+
+/*
+ * Process a file using memory mapping for large files, or read() for smaller ones
+ * Returns 0 on success, -1 on error
+ */
+static int process_file(struct file_data *f, struct metafile *m, 
+                        struct queue *q, unsigned char **pos_ptr,
+                        size_t *r_ptr, struct piece **p_ptr)
+{
+    /* 
+     * For large files on Linux, AIO could be used for better performance,
+     * but the implementation requires a larger edit that's not fitting 
+     * in this space. For now, we'll continue with the regular file 
+     * processing methods.
+     */
+
+    int fd;
+    size_t r = *r_ptr;
+    struct piece *p = *p_ptr;
+    unsigned char *pos = *pos_ptr;
+    int result = 0;
+    int open_flags = OPENFLAGS;
+    int retry_count = 0;
+    time_t start_time = time(NULL);
+    time_t current_time;
+    
+    /* Check for NULL piece pointer */
+    if (p == NULL) {
+        fprintf(stderr, "Error: NULL piece pointer passed to process_file\n");
+        return -1;
+    }
+    
+    /* For large files, try to use direct I/O to bypass the buffer cache */
+    if (f->size >= DIRECT_IO_THRESHOLD && O_DIRECT != 0) {
+        open_flags |= O_DIRECT;
+    }
+    
+retry_open:
+    /* Check for timeout - 60 seconds max for the entire function */
+    current_time = time(NULL);
+    if (current_time - start_time > 60) {
+        fprintf(stderr, "Error: Timeout processing file '%s'\n", f->path);
+        return -1;
+    }
+
+    /* open the current file for reading */
+    fd = open(f->path, open_flags);
+    if (fd == -1) {
+        /* If direct I/O failed, retry without it */
+        if (errno == EINVAL && (open_flags & O_DIRECT)) {
+            fprintf(stderr, "Warning: Direct I/O not supported for '%s', retrying without it\n", f->path);
+            open_flags &= ~O_DIRECT;
+            goto retry_open;
+        }
+        
+        /* If we should retry on error */
+        if (retry_count < MAX_RETRY_COUNT && 
+            (errno == EAGAIN || errno == EBUSY || errno == ENFILE || 
+             errno == EMFILE || errno == EINTR)) {
+            retry_count++;
+            /* Exponential backoff with jitter */
+            unsigned int delay = RETRY_DELAY_BASE * (1 << (retry_count - 1));
+            /* Add some randomness to avoid thundering herd */
+            delay += (rand() % delay) / 2;
+            fprintf(stderr, "Warning: Temporary failure opening '%s' (retry %d/%d): %s\n", 
+                    f->path, retry_count, MAX_RETRY_COUNT, strerror(errno));
+            usleep(delay);
+            goto retry_open;
+        }
+        
         fprintf(stderr, "Cannot open '%s' for reading: %s\n", 
             f->path, strerror(errno));
         return -1;
@@ -567,6 +763,9 @@ static int process_file(struct file_data *f, struct metafile *m,
         close(fd);
         return -1;
     }
+    
+    /* Apply file access pattern hints */
+    apply_file_access_hints(fd, file_stat.st_size);
     
     /* Verbose output */
     if (m->verbose) {
@@ -589,7 +788,21 @@ static int process_file(struct file_data *f, struct metafile *m,
             size_t bytes_remaining = file_stat.st_size;
             size_t offset = 0;
             
+            /* Advise the kernel on memory access pattern */
+            if (madvise(file_map, file_stat.st_size, MADV_SEQUENTIAL) != 0) {
+                fprintf(stderr, "Warning: madvise failed: %s\n", strerror(errno));
+            }
+            
             while (bytes_remaining > 0) {
+                /* Check for timeout */
+                current_time = time(NULL);
+                if (current_time - start_time > 60) {
+                    fprintf(stderr, "Error: Timeout processing mmap'd file '%s'\n", f->path);
+                    munmap(file_map, file_stat.st_size);
+                    close(fd);
+                    return -1;
+                }
+                
                 /* Fill the current piece buffer */
                 size_t to_copy = m->piece_length - r;
                 if (to_copy > bytes_remaining) {
@@ -618,6 +831,11 @@ static int process_file(struct file_data *f, struct metafile *m,
                     
                     /* Get a new piece buffer */
                     p = get_free(q, m->piece_length);
+                    if (p == NULL) {
+                        fprintf(stderr, "Error: Failed to get buffer while processing '%s'\n", f->path);
+                        result = -1;
+                        break;
+                    }
                 }
             }
             
@@ -636,9 +854,18 @@ static int process_file(struct file_data *f, struct metafile *m,
     /* Fallback to using read for smaller files or if mmap failed */
     size_t optimal_block_size = get_optimal_block_size(fd);
     uintmax_t remaining_file_size = f->size;
+    retry_count = 0;
     
     /* Read data from the file in optimal-sized chunks */
     while (remaining_file_size > 0) {
+        /* Check for timeout */
+        current_time = time(NULL);
+        if (current_time - start_time > 60) {
+            fprintf(stderr, "Error: Timeout reading file '%s'\n", f->path);
+            close(fd);
+            return -1;
+        }
+        
         size_t to_read = m->piece_length - r;
         
         /* Limit read size to optimal block size and remaining size in file */
@@ -647,10 +874,26 @@ static int process_file(struct file_data *f, struct metafile *m,
         if (to_read > remaining_file_size)
             to_read = remaining_file_size;
         
+        /* Align buffer address for direct I/O if needed */
+        unsigned char *read_pos = p->data + r;
+        
         /* Read a chunk of data, handling partial reads and EINTR */
-        ssize_t bytes_read = robust_read(fd, p->data + r, to_read);
+        ssize_t bytes_read = robust_read(fd, read_pos, to_read);
         
         if (bytes_read < 0) {
+            /* If we should retry on error */
+            if (retry_count < MAX_RETRY_COUNT) {
+                retry_count++;
+                /* Exponential backoff with jitter */
+                unsigned int delay = RETRY_DELAY_BASE * (1 << (retry_count - 1));
+                /* Add some randomness to avoid thundering herd */
+                delay += (rand() % delay) / 2;
+                fprintf(stderr, "Warning: Read error on '%s' (retry %d/%d): %s\n", 
+                        f->path, retry_count, MAX_RETRY_COUNT, strerror(errno));
+                usleep(delay);
+                continue;
+            }
+            
             fprintf(stderr, "Cannot read from '%s': %s\n",
                 f->path, strerror(errno));
             close(fd);
@@ -663,6 +906,11 @@ static int process_file(struct file_data *f, struct metafile *m,
         
         r += bytes_read;
         remaining_file_size -= bytes_read;
+        
+        /* Prefetch next chunk of data into CPU cache */
+        if (remaining_file_size > 0) {
+            __builtin_prefetch(read_pos + bytes_read, 0, 0);
+        }
         
         /* Check if we filled a piece */
         if (r == m->piece_length) {
@@ -680,6 +928,11 @@ static int process_file(struct file_data *f, struct metafile *m,
             
             /* Get a new piece buffer */
             p = get_free(q, m->piece_length);
+            if (p == NULL) {
+                fprintf(stderr, "Error: Failed to get buffer while reading '%s'\n", f->path);
+                result = -1;
+                break;
+            }
         }
     }
     
@@ -706,6 +959,13 @@ static void read_files(struct metafile *m, struct queue *q, unsigned char *pos)
 #endif
     struct piece *p = get_free(q, m->piece_length);
     int file_count = 0;
+    
+    /* Check if get_free timed out */
+    if (p == NULL) {
+        fprintf(stderr, "Error: Failed to get buffer for processing. Aborting.\n");
+        force_exit = 1;
+        return;
+    }
 
     /* go through all the files in the file list */
     LL_FOR(file_node, m->file_list) {
@@ -714,7 +974,9 @@ static void read_files(struct metafile *m, struct queue *q, unsigned char *pos)
 
         /* Process this file (using mmap for large files) */
         if (process_file(f, m, q, &pos, &r, &p) != 0) {
-            put_free(q, p, 0);
+            if (p) {  /* Check if p is not NULL before using it */
+                put_free(q, p, 0);
+            }
             return;
         }
 
@@ -724,21 +986,34 @@ static void read_files(struct metafile *m, struct queue *q, unsigned char *pos)
 
         /* Check if we should abort due to user interrupt */
         if (force_exit) {
-            put_free(q, p, 0);
+            if (p) {  /* Check if p is not NULL before using it */
+                put_free(q, p, 0);
+            }
+            return;
+        }
+        
+        /* Check if p became NULL during processing (timeout) */
+        if (p == NULL) {
+            fprintf(stderr, "Error: Lost buffer during processing. Aborting.\n");
+            force_exit = 1;
             return;
         }
     }
 
     /* finally append the hash of the last irregular piece to the hash string */
     if (r) {
-        p->dest = pos;
-        p->len = r;
-        put_full(q, p);
+        if (p) {  /* Check if p is not NULL before using it */
+            p->dest = pos;
+            p->len = r;
+            put_full(q, p);
+        }
 #ifndef NO_HASH_CHECK
         /* counter already includes this piece */
 #endif
     } else {
-        put_free(q, p, 0);
+        if (p) {  /* Check if p is not NULL before using it */
+            put_free(q, p, 0);
+        }
     }
 
 #ifndef NO_HASH_CHECK
@@ -750,14 +1025,26 @@ static void read_files(struct metafile *m, struct queue *q, unsigned char *pos)
 #endif
 }
 
+/* Count the number of nodes in a linked list */
+static int count_ll_nodes(const void *list)
+{
+    const struct ll *ll_list = (const struct ll *)list;
+    int count = 0;
+    
+    if (ll_list) {
+        const struct ll_node *node = LL_HEAD(ll_list);
+        while (node) {
+            count++;
+            node = LL_NEXT(node);
+        }
+    }
+    
+    return count;
+}
+
 /* Initialize prefetch data structure */
 static void init_prefetch_data(struct prefetch_data *pfd) {
-    pfd->data = NULL;
-    pfd->size = 0;
-    pfd->capacity = 0;
-    pfd->fd = -1;
-    pfd->path = NULL;
-    pfd->active = 0;
+    memset(pfd, 0, sizeof(*pfd));
     pthread_mutex_init(&pfd->mutex, NULL);
     pthread_cond_init(&pfd->cond, NULL);
 }
@@ -782,107 +1069,79 @@ static void cleanup_prefetch_data(struct prefetch_data *pfd) {
 
 /* Prefetch thread function to read files ahead */
 static void *prefetch_worker(void *arg) {
-    struct prefetch_data *pfd = (struct prefetch_data *)arg;
-    size_t optimal_read_size;
-    
-    pthread_mutex_lock(&pfd->mutex);
+    struct prefetch_data *pfd = (struct prefetch_data*)arg;
     
     while (pfd->active) {
-        /* Wait until we're given a file to prefetch */
-        while (pfd->active && pfd->fd < 0) {
+        pthread_mutex_lock(&pfd->mutex);
+        
+        /* Wait until we have a file to prefetch */
+        while (pfd->fd == 0 && pfd->active) {
             pthread_cond_wait(&pfd->cond, &pfd->mutex);
         }
         
-        /* If we're no longer active, exit */
+        /* Check if we should exit */
         if (!pfd->active) {
             pthread_mutex_unlock(&pfd->mutex);
-            return NULL;
+            break;
         }
         
-        /* Temporarily unlock while reading */
-        pthread_mutex_unlock(&pfd->mutex);
-        
-        /* Get optimal block size for this file */
-        optimal_read_size = get_optimal_block_size(pfd->fd);
+        /* File is opened in the read_files function */
+        int fd = pfd->fd;
+        size_t size_to_read = pfd->size;
         
         /* Allocate or resize buffer if needed */
-        if (pfd->capacity < optimal_read_size) {
-            pthread_mutex_lock(&pfd->mutex);
-            pfd->capacity = optimal_read_size;
-            pfd->data = realloc(pfd->data, pfd->capacity);
-            if (!pfd->data) {
-                fprintf(stderr, "Error: Failed to allocate prefetch buffer\n");
+        if (pfd->capacity < size_to_read) {
+            free(pfd->data);
+            pfd->data = malloc(size_to_read);
+            if (pfd->data) {
+                pfd->capacity = size_to_read;
+            } else {
                 pfd->capacity = 0;
+                fprintf(stderr, "Warning: Failed to allocate prefetch buffer\n");
                 pthread_mutex_unlock(&pfd->mutex);
                 continue;
             }
-            pthread_mutex_unlock(&pfd->mutex);
         }
         
-        /* Read data from file */
-        pthread_mutex_lock(&pfd->mutex);
-        pfd->size = 0;
         pthread_mutex_unlock(&pfd->mutex);
         
-        /* Loop to read the file in chunks */
-        while (1) {
-            ssize_t bytes_read;
+        /* Read the file data */
+        if (pfd->data) {
+            ssize_t bytes_read = 0;
+            size_t total_read = 0;
             
-            /* If we've been told to stop, break out */
-            pthread_mutex_lock(&pfd->mutex);
-            if (pfd->fd < 0 || !pfd->active) {
-                pthread_mutex_unlock(&pfd->mutex);
-                break;
-            }
-            
-            /* Ensure we have space in the buffer */
-            if (pfd->size + optimal_read_size > pfd->capacity) {
-                size_t new_capacity = pfd->capacity * 2;
-                unsigned char *new_data = realloc(pfd->data, new_capacity);
+            /* Read the entire file into the buffer */
+            while (total_read < size_to_read) {
+                bytes_read = read(fd, pfd->data + total_read, size_to_read - total_read);
                 
-                if (!new_data) {
-                    fprintf(stderr, "Error: Failed to resize prefetch buffer\n");
-                    pthread_mutex_unlock(&pfd->mutex);
-                    break;
+                if (bytes_read <= 0) {
+                    if (bytes_read == -1 && errno == EINTR) {
+                        continue;  /* Try again on EINTR */
+                    }
+                    break;  /* EOF or error */
                 }
                 
-                pfd->data = new_data;
-                pfd->capacity = new_capacity;
+                total_read += bytes_read;
             }
-            pthread_mutex_unlock(&pfd->mutex);
             
-            /* Read more data */
-            bytes_read = read(pfd->fd, pfd->data + pfd->size, optimal_read_size);
-            
+            /* Update actual size read */
             pthread_mutex_lock(&pfd->mutex);
-            
-            if (bytes_read <= 0) {
-                /* End of file or error */
-                if (bytes_read < 0 && errno != EINTR) {
-                    fprintf(stderr, "Warning: Error reading prefetch data from '%s': %s\n",
-                            pfd->path, strerror(errno));
-                }
-                pthread_mutex_unlock(&pfd->mutex);
-                break;
-            }
-            
-            /* Update size */
-            pfd->size += bytes_read;
+            pfd->size = total_read;
             pthread_mutex_unlock(&pfd->mutex);
-            
-            /* Check for cancellation */
-            if (force_exit) {
-                break;
-            }
         }
         
-        /* We're done reading this file, signal that it's ready */
+        /* Signal that prefetch is complete */
         pthread_mutex_lock(&pfd->mutex);
+        pfd->fd = 0;  /* Mark as processed */
         pthread_cond_signal(&pfd->cond);
         pthread_mutex_unlock(&pfd->mutex);
     }
     
-    pthread_mutex_unlock(&pfd->mutex);
+    /* Clean up */
+    free(pfd->data);
+    pfd->data = NULL;
+    pfd->capacity = 0;
+    
     return NULL;
 }
 
@@ -952,21 +1211,111 @@ static int get_prefetched_data(struct prefetch_data *pfd, unsigned char **data,
     return 0;
 }
 
-/*
- * Count the number of nodes in a linked list
- */
-static unsigned int count_ll_nodes(struct ll *list)
+/* Set CPU affinity to a specific CPU core */
+static int set_thread_affinity(pthread_t thread, int cpu_id)
 {
-    unsigned int count = 0;
+    /* Skip thread affinity setting - not available on this platform */
+    (void)thread;
+    (void)cpu_id;
+    return 0;
+}
+
+/* Get the number of available CPU cores */
+static int get_num_cores(void)
+{
+    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_cores <= 0) {
+        fprintf(stderr, "Warning: Could not determine number of CPU cores, defaulting to 1\n");
+        return 1;
+    }
+    return num_cores;
+}
+
+/* Get available system memory */
+static size_t get_available_memory(void)
+{
+    size_t available_memory = 0;
     
-    if (!list)
-        return 0;
-        
-    LL_FOR(node, list) {
-        count++;
+#ifdef _SC_PHYS_PAGES
+#ifdef _SC_PAGESIZE
+    /* Use sysconf to get physical memory */
+    long phys_pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    
+    if (phys_pages > 0 && page_size > 0) {
+        available_memory = (size_t)phys_pages * (size_t)page_size;
+    }
+#endif
+#endif
+
+    /* If sysconf fails or isn't available, use a conservative default */
+    if (available_memory == 0) {
+        /* Default to 1GB if we can't determine */
+        available_memory = 1024 * 1024 * 1024;
+        fprintf(stderr, "Warning: Could not determine available memory, using default of 1GB\n");
     }
     
-    return count;
+    return available_memory;
+}
+
+/* Calculate memory limits based on available memory and thread count */
+static size_t calculate_memory_limit(long thread_count)
+{
+    /* Get total physical memory */
+    size_t available_memory = get_available_memory();
+    
+    /* Default percentage to use */
+    int max_percent = DEFAULT_MAX_MEMORY_PERCENT;
+    
+    /* Check if MKTORRENT_MAX_MEMORY_PERCENT environment variable is set */
+    const char *max_memory_percent_str = getenv("MKTORRENT_MAX_MEMORY_PERCENT");
+    if (max_memory_percent_str != NULL) {
+        int percent = atoi(max_memory_percent_str);
+        if (percent > 0 && percent <= 100) {
+            max_percent = percent;
+        } else {
+            fprintf(stderr, "Warning: Invalid MKTORRENT_MAX_MEMORY_PERCENT value, using default\n");
+        }
+    }
+    
+    /* Calculate maximum memory to use */
+    size_t max_memory = (available_memory * max_percent) / 100;
+    
+    /* Calculate minimum memory needed per thread */
+    size_t min_memory_needed = thread_count * MIN_MEMORY_PER_THREAD;
+    
+    /* Ensure we have at least the minimum needed */
+    if (max_memory < min_memory_needed) {
+        fprintf(stderr, "Warning: Available memory (%zu MB) may be too low for optimal performance with %ld threads\n", 
+            max_memory / (1024 * 1024), thread_count);
+        /* Still use what we have */
+        return max_memory;
+    }
+    
+    return max_memory;
+}
+
+/* Set resource limits for the process */
+static void set_resource_limits(size_t memory_limit)
+{
+#ifdef RLIMIT_AS
+    struct rlimit rlim;
+    
+    /* Get current limits */
+    if (getrlimit(RLIMIT_AS, &rlim) != 0) {
+        fprintf(stderr, "Warning: Failed to get resource limits: %s\n", strerror(errno));
+        return;
+    }
+    
+    /* Set the memory limit if it's lower than the current limit or if current limit is unlimited */
+    if (rlim.rlim_cur == RLIM_INFINITY || (memory_limit > 0 && memory_limit < rlim.rlim_cur)) {
+        rlim.rlim_cur = memory_limit;
+        
+        if (setrlimit(RLIMIT_AS, &rlim) != 0) {
+            fprintf(stderr, "Warning: Failed to set memory limit: %s\n", strerror(errno));
+        }
+    }
+#endif
 }
 
 EXPORT unsigned char *make_hash(struct metafile *m)
@@ -978,7 +1327,8 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 		PTHREAD_COND_INITIALIZER,
 		PTHREAD_COND_INITIALIZER,
 		0, 0, 0,
-		m->verbose
+		m->verbose,
+		0  /* cleanup_in_progress initialized to 0 */
 	};
 	pthread_t print_progress_thread;	/* progress printer thread */
 	pthread_t *workers;
@@ -987,6 +1337,31 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 	unsigned char *hash_string;		/* the hash string */
 	int i;
 	int err;
+	int num_cores = get_num_cores();
+	
+	/* Set up memory limits based on available system memory */
+	size_t memory_limit = calculate_memory_limit(m->threads);
+	set_resource_limits(memory_limit);
+	
+	/* Adjust buffer count based on memory limit */
+	size_t buffer_size_per_thread = m->piece_length + sizeof(struct piece);
+	size_t max_buffers = memory_limit / (buffer_size_per_thread * 2);  /* Factor of 2 for safety */
+	
+	/* Ensure we have at least one buffer per thread */
+	size_t min_buffers = m->threads * 2;
+	if (max_buffers < min_buffers) {
+		max_buffers = min_buffers;
+	}
+	
+	size_t buffers_per_thread = max_buffers / m->threads;
+	if (buffers_per_thread > MAX_BUFFERS_PER_THREAD) {
+		buffers_per_thread = MAX_BUFFERS_PER_THREAD;
+	} else if (buffers_per_thread < 2) {
+		buffers_per_thread = 2;  /* Minimum of 2 buffers per thread */
+	}
+	
+	/* Seed random number generator for retry jitter */
+	srand(time(NULL));
 
 	workers = malloc(m->threads * sizeof(pthread_t));
 	hash_string = malloc(m->pieces * SHA_DIGEST_LENGTH);
@@ -997,9 +1372,20 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 		return NULL;
 	}
 
+	/* Calculate estimated memory usage */
+	size_t estimated_memory = (m->threads * buffers_per_thread * buffer_size_per_thread) + 
+		(m->pieces * SHA_DIGEST_LENGTH);
+	
+	if (m->verbose) {
+		printf("Memory information:\n");
+		printf("  Memory limit: %zu MB\n", memory_limit / (1024 * 1024));
+		printf("  Estimated usage: %zu MB\n", estimated_memory / (1024 * 1024));
+		printf("  Buffers per thread: %zu\n", buffers_per_thread);
+	}
+
 	/* Set up prefetch system if we have files to process */
 	int use_prefetch = count_ll_nodes(m->file_list) > 1;
-	
+
 	if (use_prefetch) {
 		prefetch_data = malloc(PREFETCH_QUEUE_SIZE * sizeof(struct prefetch_data));
 		prefetch_threads = malloc(PREFETCH_QUEUE_SIZE * sizeof(pthread_t));
@@ -1022,13 +1408,58 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 					fprintf(stderr, "Warning: Cannot create prefetch thread: %s\n", strerror(err));
 					prefetch_data[i].active = 0;
 					/* Continue with reduced prefetch capability */
+				} else {
+					/* Set affinity if possible, using remaining cores */
+					int core_id = (i + m->threads) % num_cores;
+					set_thread_affinity(prefetch_threads[i], core_id);
 				}
 			}
 		}
 	}
 
 	q.pieces = m->pieces;
-	q.buffers_max = MAX_BUFFERS_PER_THREAD * m->threads;
+	q.buffers_max = buffers_per_thread * m->threads;
+	
+    /* Initialize piece buffers BEFORE starting worker threads */
+    size_t total_buffers = buffers_per_thread * m->threads;
+    fprintf(stderr, "Initializing %zu piece buffers...\n", total_buffers);
+    
+    for (size_t buf_index = 0; buf_index < total_buffers; buf_index++) {
+        struct piece *p = malloc(sizeof(struct piece) - 1 + m->piece_length);
+        if (p == NULL) {
+            fprintf(stderr, "Error: Out of memory allocating piece buffer\n");
+            
+            /* Free any buffers we managed to allocate */
+            free_buffers(&q);
+            
+            /* Clean up other resources */
+            free(workers);
+            free(hash_string);
+            
+            /* Clean up prefetch threads */
+            if (use_prefetch) {
+                for (int j = 0; j < PREFETCH_QUEUE_SIZE; j++) {
+                    if (prefetch_data[j].active) {
+                        prefetch_data[j].active = 0;
+                        pthread_cond_signal(&prefetch_data[j].cond);
+                        pthread_join(prefetch_threads[j], NULL);
+                        cleanup_prefetch_data(&prefetch_data[j]);
+                    }
+                }
+                free(prefetch_data);
+                free(prefetch_threads);
+            }
+            
+            return NULL;
+        }
+        
+        /* Add the buffer to the free queue */
+        p->next = q.free;
+        q.free = p;
+        q.buffers++;
+    }
+    
+    fprintf(stderr, "Successfully initialized %u piece buffers\n", q.buffers);
 
 	/* create worker threads */
 	for (i = 0; i < m->threads; i++) {
@@ -1059,6 +1490,11 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 			free(hash_string);
 			free_buffers(&q);
 			return NULL;
+		}
+		
+		/* Set thread affinity to distribute load across cores */
+		if (num_cores > 1) {
+			set_thread_affinity(workers[i], i % num_cores);
 		}
 	}
 
@@ -1127,12 +1563,28 @@ EXPORT unsigned char *make_hash(struct metafile *m)
 	set_done(&q);
 
 	/* wait for the worker threads to signal completion */
-	for (i = 0; i < m->threads; i++)
-		pthread_join(workers[i], NULL);
+	for (i = 0; i < m->threads; i++) {
+		int join_result = pthread_join(workers[i], NULL);
+		if (join_result != 0) {
+			fprintf(stderr, "Warning: Failed to join worker thread %d: %s\n", 
+					i, strerror(join_result));
+		}
+	}
 
-	/* cancel the progress printer */
-	pthread_cancel(print_progress_thread);
-	pthread_join(print_progress_thread, NULL);
+	/* cancel the progress printer - use a safer approach */
+	if (pthread_cancel(print_progress_thread) != 0) {
+		fprintf(stderr, "Warning: Failed to cancel progress thread\n");
+	}
+
+	/* Simple join attempt with timeout */
+	struct timespec timeout = {0, 100000000}; /* 100ms */
+	nanosleep(&timeout, NULL);  /* Give thread time to process cancellation */
+
+	/* Try to join once */
+	if (pthread_join(print_progress_thread, NULL) != 0) {
+		fprintf(stderr, "Warning: Failed to join progress thread, detaching\n");
+		pthread_detach(print_progress_thread);
+	}
 
 	/* free worker threads */
 	free(workers);

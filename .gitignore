@@ -3,3 +3,4 @@ build/
 compile_commands.json
 tests/test_data/
 tests/test_results/
+install.sh
